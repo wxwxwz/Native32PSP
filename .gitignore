@@ -1,0 +1,37 @@
+# Local settings and credentials
+.claude/
+.codex/
+.agents/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+# Build and test output
+*.o
+*.d
+*.elf
+*.prx
+*.PBP
+*.pbp
+PARAM.SFO
+*.map
+/build/
+/dist/
+/tmp/
+/tests/out/
+__pycache__/
+*.pyc
+# User content
+/games/
+/screenshots/
+settings.txt
+*.log
+*.ssl_sav*
+*.cheats
+*.bak
+# Editors
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
