@@ -8,6 +8,7 @@ OBJS = \
 	src/platform/psp_log.o \
 	src/platform/psp_settings.o \
 	src/platform/psp_app.o \
+	src/platform/game_presentation.o \
 	src/platform/pause_menu.o \
 	src/platform/screenshots.o \
 	src/platform/system_info.o \

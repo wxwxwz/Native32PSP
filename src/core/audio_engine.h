@@ -6,6 +6,18 @@
 
 namespace n32 {
 
+// Source bytes/format describe the slowest playSound attempt, including a
+// failure after resource lookup. Format -1 means no sound resource was read.
+struct SoundTickProfile {
+    u32 calls, maxMicros, slowBytes;
+    u64 totalMicros;
+    u16 slowSoundValue;
+    s32 slowFormat;
+    SoundTickProfile()
+        : calls(0), maxMicros(0), slowBytes(0), totalMicros(0),
+          slowSoundValue(0), slowFormat(-1) {}
+};
+
 class AudioEngine {
 public:
     AudioEngine();
@@ -31,7 +43,9 @@ public:
     bool isChannelPlaying(size_t channelId) const;
     bool isPlaying() const;
     void setVolume(u32 volumeValue);
+    void resetProfile();
 
+    SoundTickProfile profile;
     float volume;
     Colorspace colorspace;
     size_t nextChannelId;

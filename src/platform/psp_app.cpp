@@ -31,8 +31,8 @@ static const size_t kAudioRingSamples = 32768 * 2;
 // A dedicated output thread feeds these aligned ~23 ms hardware blocks.
 // Prime with two blocks so 30 Hz producer bursts do not starve the device.
 static const size_t kAudioBlockFrames = 1024;
-static const int kSettingsRows[4][3]={{0,1,3},{2,-1,-1},{4,8,5},{6,7,-1}};
-static const unsigned kSettingsCounts[4]={3,1,3,2};
+static const int kSettingsRows[4][4]={{0,9,1,3},{2,-1,-1,-1},{4,8,5,-1},{6,7,-1,-1}};
+static const unsigned kSettingsCounts[4]={4,1,3,2};
 
 static u32* vramPointer(void* buffer) {
     u8* edram = (u8*)sceGeEdramGetAddr();
@@ -141,8 +141,7 @@ PspApp::PspApp()
       audioRing(kAudioRingSamples, 0), audioReadPos(0), audioWritePos(0), audioQueuedSamples(0),
       audioOutputBudget(0), audioDropped(0), audioDroppedLogged(0), scanAnimation(0),
       renderCadence(), coreClock(), coreTickCounter(0), lastCoreMicros(0), displayFps(),
-      statusLine("boot"), selectedIndex(0), menuFrame(480 * 272, 0xff121418),
-      pspFrame(), pspFrameWidth(0), pspFrameHeight(0) {
+      statusLine("boot"), selectedIndex(0), menuFrame(480 * 272, 0xff121418) {
     gameBackgroundDirty[0] = gameBackgroundDirty[1] = true;
     pspLog("PspApp: constructed");
 }
@@ -279,6 +278,9 @@ void PspApp::readInput() {
         if (pauseMode) resumeGame();
         else {
             pauseMode = true; cheatMode = false; pauseIndex = 0; pauseStatus.clear();
+            pspLog("pause: enter video=%u source=%ux%u transfer=%s", emulator.isVideoFrame()?1u:0u,
+                   (unsigned)emulator.framebufferWidth(), (unsigned)emulator.framebufferHeight(),
+                   gamePresentation.usesTexture()?"GU-texture":"GE-copy");
             buttons.clear(); emulator.setButtons(buttons); clearAudioQueue();
         }
         return;
@@ -324,7 +326,7 @@ void PspApp::readInput() {
             menuMode = false;
             coreClock.reset(); displayFps.reset(); // Time spent choosing is a pause, not backlog.
             renderCadence.reset();
-            pspFrame.clear();
+            gamePresentation.clear();
             return;
         }
         if (pressed & PSP_CTRL_TRIANGLE) {
@@ -355,6 +357,9 @@ void PspApp::readInput() {
         buttons.clear();
         emulator.setButtons(buttons);
         clearAudioQueue();
+        // skipCutscene may redraw outside tick(). Publish that image even if
+        // the next fixed-skip tick is suppressed and its dimensions match.
+        gamePresentation.clear();
         coreClock.reset(); displayFps.reset();
         renderCadence.reset();
         return;
@@ -395,7 +400,25 @@ void PspApp::drawFrame() {
     }
 }
 
+bool PspApp::captureGameFrame(std::vector<u32>* pixels) {
+    if(!pixels || gamePresentation.empty())return false;
+    // Re-draw the retained game texture into the non-visible page without HUD
+    // or notices. Read back only on demand; normal frames never pay this cost.
+    u32* back=vramPointer(drawBuffer);
+    gamePresentation.draw(drawBuffer,back,displayList);
+    const u32 w=gamePresentation.width(),h=gamePresentation.height();
+    const u32 x=(480-w)/2,y=(272-h)/2;
+    pixels->resize((size_t)w*h);
+    for(u32 row=0;row<h;++row)
+        memcpy(pixels->data()+(size_t)row*w,back+(y+row)*512+x,w*sizeof(u32));
+    gameBackgroundDirty[drawBuffer?1:0]=true;
+    return true;
+}
+
 void PspApp::drawGameFrame() {
+    // UI uploads are only needed while a menu/loading screen is visible.
+    // Keep the retained game surface separate for pause-menu screenshots.
+    if (!menuPresentation.empty()) menuPresentation.release();
     ++frameCounter;
     bool copiedFrame = false;
     bool measuredRender=false;
@@ -418,10 +441,16 @@ void PspApp::drawGameFrame() {
         for (unsigned step = 0; step < due; ++step) {
             ++coreTickCounter;
             bool render = step + 1 == due;
-            if (settings.frameSkip == SkipOne) render = render && (coreTickCounter & 1u);
+            const bool videoTick = emulator.isCutsceneActive();
+            // A catch-up pass already omits its first tick's picture. Present
+            // the last tick regardless of parity so repeated two-tick passes
+            // cannot lock fixed frame skip onto an always-discarded phase.
+            if (settings.frameSkip == SkipOne) render = render && (due > 1 || (coreTickCounter & 1u));
             // Advance cadence only at a presentation opportunity. Advancing on
             // catch-up ticks can phase-lock all draws to discarded frames.
-            if (settings.frameSkip == SkipAuto && render) {
+            // MPEG has its own measured B-picture budget. Applying the game
+            // cadence as well discards otherwise affordable video pictures.
+            if (settings.frameSkip == SkipAuto && render && !videoTick) {
                 const bool scheduled = renderCadence.next();
                 render = render && scheduled;
             }
@@ -440,9 +469,16 @@ void PspApp::drawGameFrame() {
                 clearAudioQueue();
                 return;
             }
-            rendered = rendered || render;
+            // A 25 Hz clip or a skipped B picture can retain the prior RGB
+            // image even when presentation was requested on this 30 Hz tick.
+            // Keep feeding audio, but do not upload/swap that image again.
+            rendered = rendered || emulator.frameChanged;
             const u32 mixBegin=sceKernelGetSystemTimeLow();
             logicTiming.add(mixBegin-before);
+            if (!videoTick && !emulator.isCutsceneActive() && !startingContent && emulator.tickCount > 1)
+                recordGameProfile(mixBegin-before, mixBegin);
+            if(emulator.frameChanged && !videoTick && !emulator.isCutsceneActive())
+                drawTiming.add(emulator.lastDrawMicros);
             emulator.pendingAudioSamples(&audioSamples);
             // Streaming MP3 decoding is part of the tick budget as well.
             lastCoreMicros = sceKernelGetSystemTimeLow() - before;
@@ -451,8 +487,13 @@ void PspApp::drawGameFrame() {
             mixTiming.add(end-mixBegin);
             // File reads, demux and scene initialization are not steady-state
             // frame costs. Do not let one load hold an entire short clip at 10 FPS.
-            if(startingContent || emulator.tickCount<=1) renderCadence.reset();
-            else if(render){measuredRender=true;renderCost=end-before;}
+            // Preserve the game's cadence across clips, including queued and
+            // final video ticks. MPEG costs must not train the game estimator.
+            if(videoTick || emulator.isCutsceneActive()) measuredRender=false;
+            else if(startingContent || emulator.tickCount<=1) renderCadence.reset();
+            // Only a tick that produced pixels can confirm cadence recovery;
+            // cheap retained-image ticks must behave like skipped rendering.
+            else if(emulator.frameChanged){measuredRender=true;renderCost=end-before;}
             else renderCadence.observe(false,end-before);
         }
         if (frameCounter <= 1) {
@@ -463,15 +504,16 @@ void PspApp::drawGameFrame() {
         if(loadingShown && emulator.tickCount==0) {coreClock.reset();return;}
         if(loadingShown && rendered) {
             loadingShown=false;loadingStage.clear();std::vector<u32>().swap(loadingPanel);coreClock.reset();displayFps.reset();
-            renderCadence.reset();
+            if(!emulator.isCutsceneActive())renderCadence.reset();
         }
         copyBegin=sceKernelGetSystemTimeLow();
         const std::vector<u32>& fb = emulator.framebuffer();
-        srcW = emulator.gameWidth();
-        srcH = emulator.gameHeight();
+        srcW = emulator.framebufferWidth();
+        srcH = emulator.framebufferHeight();
+        const VideoScaling scaling = emulator.isVideoFrame() ? videoScaling(srcW,srcH) : settings.scaling;
         fbPixels = fb.size();
         if (!fb.empty() && srcW > 0 && srcH > 0 && srcW <= fb.size() / srcH) {
-            scaledSize(srcW, srcH, settings.scaling, &copyW, &copyH);
+            scaledSize(srcW, srcH, scaling, &copyW, &copyH);
             dstX = (480 - (int)copyW) / 2;
             dstY = (272 - (int)copyH) / 2;
             if (dstX < 0) {
@@ -480,24 +522,12 @@ void PspApp::drawGameFrame() {
             if (dstY < 0) {
                 dstY = 0;
             }
-            if (rendered || pspFrame.empty() || pspFrameWidth != copyW || pspFrameHeight != copyH) {
-                if (pspFrameWidth != copyW || pspFrameHeight != copyH)
+            if (rendered || gamePresentation.empty() || gamePresentation.width() != copyW || gamePresentation.height() != copyH) {
+                if (gamePresentation.width() != copyW || gamePresentation.height() != copyH)
                     gameBackgroundDirty[0] = gameBackgroundDirty[1] = true;
-                pspFrame.resize((size_t)copyW * copyH);
-                u32 columns[480];
-                for(u32 x=0;x<copyW;++x) columns[x]=settings.scaling==ScaleOriginal ? x : (u32)((u64)x*srcW/copyW);
-                for (u32 y = 0; y < copyH; ++y) {
-                    const u32 sy=settings.scaling==ScaleOriginal ? y : (u32)((u64)y*srcH/copyH);
-                    for (u32 x = 0; x < copyW; ++x) {
-                        u32 pixel = fb[(size_t)sy * srcW + columns[x]];
-                        pspFrame[y * copyW + x] = (pixel & 0xff00ff00u) |
-                            ((pixel & 0x000000ffu) << 16) |
-                            ((pixel & 0x00ff0000u) >> 16);
-                    }
-                }
-                pspFrameWidth = copyW;
-                pspFrameHeight = copyH;
-                frameUpdated = true;
+                const u32 prepareBegin=sceKernelGetSystemTimeLow();
+                frameUpdated=gamePresentation.prepare(fb,srcW,srcH,scaling,settings.smoothing);
+                prepareTiming.add(sceKernelGetSystemTimeLow()-prepareBegin);
             }
         } else if (srcW > 0 && srcH > 0) {
             pspLog("drawFrame: invalid framebuffer %ux%u pixels=%u", (unsigned)srcW,
@@ -514,35 +544,35 @@ void PspApp::drawGameFrame() {
     // input, servicing audio and waiting for vblank at the original cadence.
     const bool newGameFrame = frameUpdated;
     const bool fpsChanged = displayFps.sample(sceKernelGetSystemTimeLow());
-    if(settings.showFps && fpsChanged && !pspFrame.empty()) frameUpdated=true;
-    if(screenshotNoticeTicks && !pspFrame.empty()) frameUpdated=true;
-    if (frameUpdated && !pspFrame.empty() && copyW > 0 && copyH > 0) {
+    if(settings.showFps && fpsChanged && !gamePresentation.empty()) frameUpdated=true;
+    if(screenshotNoticeTicks && !gamePresentation.empty()) frameUpdated=true;
+    if (frameUpdated && !gamePresentation.empty() && copyW > 0 && copyH > 0) {
         if (frameCounter <= 1) {
-            pspLog("drawFrame: cpu copy begin frame=%u %ux%u at %d,%d srcW=%u",
+            pspLog("drawFrame: GE present begin frame=%u %ux%u at %d,%d srcW=%u",
                    frameCounter, (unsigned)copyW, (unsigned)copyH, dstX, dstY, (unsigned)srcW);
         }
         u32* drawBase = vramPointer(drawBuffer);
         unsigned slot = drawBase == vramPointer((void*)0) ? 0 : 1;
-        const bool clearBackground = gameBackgroundDirty[slot];
+        char fps[24];
+        unsigned fpsWidth=0,fpsHeight=0;
+        if(settings.showFps) {
+            snprintf(fps,sizeof(fps),"FPS %u",(unsigned)displayFps.value);
+            // The 3x5 font has a four-pixel advance and four-pixel padding.
+            fpsWidth=(unsigned)strlen(fps)*4-1+8;fpsHeight=13;
+        }
+        // The game redraw restores its own canvas. A shrinking HUD also needs
+        // the old panel removed from margins in the GPU framebuffer.
+        const bool smallerPanel=fpsPanelWidth[slot]>fpsWidth || fpsPanelHeight[slot]>fpsHeight;
+        const bool clearBackground = gameBackgroundDirty[slot] ||
+            (smallerPanel && (dstX>0 || dstY>0));
         if (clearBackground) {
             std::fill(drawBase, drawBase + 272 * 512, 0xff000000u);
             gameBackgroundDirty[slot] = false;
         }
-        u32* dst = drawBase + (dstY * 512) + dstX;
-        const u32* src = &pspFrame[0];
-        lastTransferGe=((uintptr_t)src&15u)==0 && (copyW&15u)==0;
-        if(lastTransferGe) {
-            // Publish the source and discard CPU aliases before the GE writes.
-            // Finish the transfer before CPU overlays or reuse of pspFrame.
-            sceKernelDcacheWritebackRange(src,copyW*copyH*sizeof(u32));
-            sceKernelDcacheWritebackInvalidateRange(drawBase,272*512*sizeof(u32));
-            sceGuStart(GU_DIRECT,displayList);
-            sceGuCopyImage(GU_PSM_8888,0,0,copyW,copyH,copyW,(void*)src,dstX,dstY,512,drawBase);
-            sceGuTexSync();sceGuFinish();sceGuSync(0,0);
-        } else {
-            for (u32 y = 0; y < copyH; ++y)
-                memcpy(dst + y * 512, src + y * copyW, copyW * sizeof(u32));
-        }
+        const u32 transferBegin=sceKernelGetSystemTimeLow();
+        gamePresentation.draw(drawBuffer,drawBase,displayList,clearBackground);
+        lastTransferGe=true;
+        transferTiming.add(sceKernelGetSystemTimeLow()-transferBegin);
         if(screenshotNoticeTicks) {
             --screenshotNoticeTicks;
             // Copying the full canvas above erases the previous toast. Keep both
@@ -551,43 +581,17 @@ void PspApp::drawGameFrame() {
             if(screenshotNoticeTicks) {
                 drawMenuRect(0,248,480,24,uiColor(0xff101319));
                 drawMenuName(8,252,screenshotNotice,accent(),472);
-                for(int row=248;row<272;++row)for(int x=0;x<480;++x) {
-                    u32 c=menuFrame[row*480+x];
-                    drawBase[row*512+x]=(c&0xff00ff00u)|((c&0xffu)<<16)|((c>>16)&0xffu);
-                }
-                sceKernelDcacheWritebackRange(drawBase+248*512,24*512*sizeof(u32));
             }
         }
         if(settings.showFps) {
-            char fps[24];snprintf(fps,sizeof(fps),"FPS %u",(unsigned)displayFps.value);
-            // The small font is 3x5 with a 4-pixel advance. Fit its ink bounds
-            // plus four pixels of padding on each side.
-            const unsigned width=(unsigned)strlen(fps)*4-1+8,height=5+8;
-            const unsigned restoreW=std::max(width,fpsPanelWidth[slot]);
-            const unsigned restoreH=std::max(height,fpsPanelHeight[slot]);
-            for(unsigned y=0;y<restoreH;++y)for(unsigned x=0;x<restoreW;++x) {
-                const bool inside=x>=(unsigned)dstX && y>=(unsigned)dstY &&
-                    x<(unsigned)dstX+copyW && y<(unsigned)dstY+copyH;
-                drawBase[y*512+x]=inside?pspFrame[(y-dstY)*copyW+x-dstX]:0xff000000u;
-            }
-            drawMenuRect(0,0,width,height,uiColor(0xff101319));
+            drawMenuRect(0,0,fpsWidth,fpsHeight,uiColor(0xff101319));
             drawMenuText(4,4,fps,accent(),1);
-            for(unsigned y=0;y<height;++y)for(unsigned x=0;x<width;++x) {
-                u32 c=menuFrame[y*480+x];
-                drawBase[y*512+x]=(c&0xff00ff00u)|((c&255)<<16)|((c>>16)&255);
-            }
-            fpsPanelWidth[slot]=width;fpsPanelHeight[slot]=height;
-            sceKernelDcacheWritebackRange(drawBase,restoreH*512*sizeof(u32));
-            // The HUD fully overwrites its own rectangle; no full-screen clear.
-            // Turning FPS off or changing the canvas already dirties both buffers.
         }
-        if (clearBackground)
-            sceKernelDcacheWritebackRange(drawBase, 272 * 512 * sizeof(u32));
-        else
-            sceKernelDcacheWritebackRange(dst, ((copyH - 1) * 512 + copyW) * sizeof(u32));
+        fpsPanelWidth[slot]=fpsWidth;fpsPanelHeight[slot]=fpsHeight;
+        drawGameOverlays(drawBase,fpsWidth,fpsHeight,screenshotNoticeTicks!=0);
         copiedFrame = true;
         if (frameCounter <= 1) {
-            pspLog("drawFrame: cpu copy end frame=%u", frameCounter);
+            pspLog("drawFrame: GE present end frame=%u", frameCounter);
         }
     }
 
@@ -723,18 +727,40 @@ void PspApp::drawMenuName(int x, int y, const std::string& text, u32 color, int 
     }
 }
 
+void PspApp::drawGameOverlays(u32* drawBase,unsigned fpsWidth,unsigned fpsHeight,bool notice) {
+    const unsigned fpsStride=(fpsWidth+15u)&~15u;
+    const size_t fpsPixels=(size_t)fpsStride*fpsHeight;
+    const size_t count=fpsPixels+(notice?480u*24u:0u);
+    if(!count)return;
+    // A normal FPS panel uploads only 1.6--2.5 KiB. Pack an optional screenshot
+    // notice after it so both overlays share one cache writeback and GE sync.
+    if(overlayPixels.capacity()<count+3)overlayPixels.reserve(count+3);
+    overlayPixels.resize(count+3);
+    u32* upload=reinterpret_cast<u32*>((reinterpret_cast<uintptr_t>(overlayPixels.data())+15u)&~uintptr_t(15u));
+    for(unsigned y=0;y<fpsHeight;++y)for(unsigned x=0;x<fpsWidth;++x) {
+        const u32 c=menuFrame[y*480+x];
+        upload[y*fpsStride+x]=(c&0xff00ff00u)|((c&255u)<<16)|((c>>16)&255u);
+    }
+    if(notice)for(unsigned y=0;y<24;++y)for(unsigned x=0;x<480;++x) {
+        const u32 c=menuFrame[(y+248)*480+x];
+        upload[fpsPixels+y*480+x]=(c&0xff00ff00u)|((c&255u)<<16)|((c>>16)&255u);
+    }
+    sceKernelDcacheWritebackRange(upload,count*sizeof(u32));
+    // gamePresentation.draw() already invalidated this destination. Nothing
+    // reads or writes CPU VRAM between that draw and these GPU-only overlays.
+    sceGuStart(GU_DIRECT,displayList);
+    if(fpsPixels)sceGuCopyImage(GU_PSM_8888,0,0,fpsWidth,fpsHeight,fpsStride,upload,0,0,512,drawBase);
+    if(notice)sceGuCopyImage(GU_PSM_8888,0,0,480,24,480,upload+fpsPixels,0,248,512,drawBase);
+    sceGuTexSync();sceGuFinish();sceGuSync(0,0);
+}
+
 void PspApp::presentFrame(const std::vector<u32>& pixels) {
     gameBackgroundDirty[0] = gameBackgroundDirty[1] = true;
-    u32* dst = vramPointer(drawBuffer);
-    for (int y = 0; y < 272; ++y) {
-        // Menu assets use ARGB like game images; PSP GU_PSM_8888 uses ABGR.
-        for (int x = 0; x < 480; ++x) {
-            u32 pixel = pixels[y * 480 + x];
-            dst[y * 512 + x] = (pixel & 0xff00ff00u) |
-                ((pixel & 0xffu) << 16) | ((pixel >> 16) & 0xffu);
-        }
-    }
-    sceKernelDcacheWritebackRange(dst, 272 * 512 * sizeof(u32));
+    // Submit UI pixels through the GE too. Direct CPU stores to VRAM can be
+    // hidden by PPSSPP's cached framebuffer after textured game/video draws.
+    // A separate upload preserves the retained game image for screenshots.
+    if (!menuPresentation.prepare(pixels, 480, 272, ScaleOriginal, false)) return;
+    menuPresentation.draw(drawBuffer, vramPointer(drawBuffer), displayList);
     sceDisplayWaitVblankStart();
     drawBuffer = sceGuSwapBuffers();
 }
@@ -876,6 +902,22 @@ int PspApp::audioThreadLoop() {
     return 0;
 }
 
+void PspApp::recordGameProfile(u32 micros, u32 at) {
+    ++gameSpikes.samples;
+    if (micros >= 50000) ++gameSpikes.over50ms;
+    if (gameSpikes.samples != 1 && micros <= gameSpikes.peakMicros) return;
+    gameSpikes.peakMicros = micros;
+    gameSpikes.peakAt = at;
+    gameSpikes.slowest = emulator.lastGameProfile;
+    // Keep only a bounded basename; no allocation or per-tick file writes.
+    const size_t slash = emulator.filename.find_last_of("/\\");
+    const char* name = emulator.filename.c_str() + (slash == std::string::npos ? 0 : slash + 1);
+    size_t i = 0;
+    for (; i + 1 < sizeof(gameSpikes.scene) && name[i]; ++i)
+        gameSpikes.scene[i] = name[i] == '\n' || name[i] == '\r' ? '?' : name[i];
+    gameSpikes.scene[i] = 0;
+}
+
 void PspApp::outputAudio() {
     // Snapshot diagnostics infrequently. File I/O never runs in the worker or
     // while the audio queue is locked.
@@ -893,23 +935,47 @@ void PspApp::outputAudio() {
     struct mallinfo heap=mallinfo();
     heapUsed=heap.uordblks/1024;heapFree=heap.fordblks/1024;heapArena=heap.arena/1024;
 #endif
-    // One append/open/close per snapshot instead of four storage transactions.
+    // All detailed peaks share this one append/open/close per snapshot.
     const u32 logBegin=sceKernelGetSystemTimeLow();
-    pspLog("av: core_us=%u queue_ms=%u underruns=%lu dropped=%lu errors=%lu late_ticks=%u skip=%s render_period=%u transfer=%s\n"
+    const unsigned renderPeriod=settings.frameSkip==SkipAuto && !emulator.isCutsceneActive()?
+        renderCadence.period():(settings.frameSkip==SkipOne?2u:1u);
+    const GameTickProfile& spike = gameSpikes.slowest;
+    pspLog("av: core_us=%u queue_ms=%u underruns=%lu dropped=%lu errors=%lu late_ticks=%u skip=%s render_period=%u transfer=%s fps=%u\n"
            "timing: logic_us=%u/%u mix_us=%u/%u copy_us=%u/%u wait_us=%u/%u log_us=%u/%u (avg/max)\n"
-           "resources: image_kb=%u images=%u evictions=%u sprites=%u vars=%u\n"
+           "present: prepare_us=%u/%u transfer_us=%u/%u mode=%s filter=%s surface_kb=%u\n"
+           "resources: image_kb=%u images=%u evictions=%u sprites=%u vars=%u image_limit_kb=%u file_kb=%u\n"
+           "render: draw_us=%u/%u image_decodes=%u decode_total_us=%llu decode_peak_us=%u\n"
+           "game_peak: samples=%u over50ms=%u scene=%s at_us=%u tick=%llu frame=%u input=%u rendered=%u total_us=%u timeline_us=%u movies_us=%u buttons_us=%u pending_us=%u cheats_us=%u draw_us=%u\n"
+           "game_vm: total_us=%llu calls=%u instructions=%u depth=%u slow_us=%u action=%u target=%s\n"
+           "game_sound: total_us=%llu calls=%u slow_us=%u value=%u format=%d bytes=%u\n"
            "audio: retained_kb=%u\nheap: used_kb=%u free_kb=%u arena_kb=%u",
            (unsigned)lastCoreMicros,(unsigned)(queued*1000/88200),underruns,dropped,errors,
            (unsigned)coreClock.droppedTicks,frameSkipName(settings.frameSkip),
-           settings.frameSkip==SkipAuto?renderCadence.period():(settings.frameSkip==SkipOne?2u:1u),lastTransferGe?"GE":"CPU",
+           renderPeriod,lastTransferGe?"GE":"CPU",(unsigned)displayFps.value,
            logicTiming.average(),logicTiming.peak,mixTiming.average(),mixTiming.peak,
            copyTiming.average(),copyTiming.peak,waitTiming.average(),waitTiming.peak,
            logTiming.average(),logTiming.peak,
+           prepareTiming.average(),prepareTiming.peak,transferTiming.average(),transferTiming.peak,
+           gamePresentation.usesTexture()?"GU-texture":"GE-copy",settings.smoothing?"smooth":"sharp",
+           (unsigned)(gamePresentation.retainedBytes()/1024),
            (unsigned)(emulator.reader.imageCacheBytes()/1024),(unsigned)emulator.reader.imageCacheCount(),
            (unsigned)emulator.reader.imageCacheEvictions(),(unsigned)emulator.sprites.sprites.size(),
-           (unsigned)emulator.vm.vars.size(),(unsigned)(emulator.audio.retainedAudioBytes()/1024),
+           (unsigned)emulator.vm.vars.size(),(unsigned)(emulator.reader.imageCacheBudgetBytes()/1024),
+           (unsigned)(emulator.reader.data.capacity()/1024),drawTiming.average(),drawTiming.peak,
+           (unsigned)emulator.reader.imageDecodeCount(),(unsigned long long)emulator.reader.imageDecodeTotalMicros(),
+           (unsigned)emulator.reader.imageDecodePeakMicros(),
+           gameSpikes.samples,gameSpikes.over50ms,gameSpikes.scene,gameSpikes.peakAt,
+           (unsigned long long)spike.tick,spike.frame,spike.inputMask,spike.rendered?1u:0u,gameSpikes.peakMicros,
+           spike.timelineMicros,spike.movieMicros,spike.buttonMicros,spike.pendingMicros,spike.cheatMicros,spike.drawMicros,
+           (unsigned long long)spike.vm.totalMicros,spike.vm.calls,spike.vm.instructions,spike.vm.maxDepth,
+           spike.vm.maxMicros,spike.vm.slowAction,spike.vm.slowTarget,
+           (unsigned long long)spike.sound.totalMicros,spike.sound.calls,spike.sound.maxMicros,
+           (unsigned)spike.sound.slowSoundValue,(int)spike.sound.slowFormat,spike.sound.slowBytes,
+           (unsigned)(emulator.audio.retainedAudioBytes()/1024),
            heapUsed,heapFree,heapArena);
-    logicTiming.reset();mixTiming.reset();copyTiming.reset();waitTiming.reset();logTiming.reset();
+    logicTiming.reset();mixTiming.reset();copyTiming.reset();prepareTiming.reset();transferTiming.reset();waitTiming.reset();logTiming.reset();
+    drawTiming.reset();
+    gameSpikes = GameSpikeWindow();
     logTiming.add(sceKernelGetSystemTimeLow()-logBegin);
 }
 
@@ -929,7 +995,7 @@ void PspApp::loadingCallback(void* context,const char* stage,const std::string& 
         app->loadingPanel.resize(320*44);
         for(unsigned y=0;y<44;++y)for(unsigned x=0;x<320;++x)
             app->loadingPanel[y*320+x]=blendPanel(app->menuFrame[(216+y)*480+80+x],app->uiColor(0xff101319),70);
-        app->clearAudioQueue();app->pspFrame.clear();
+        app->clearAudioQueue();app->gamePresentation.release();
     }
     app->loadingShown=true;app->loadingStage=stage;app->loadingTick=now;
     (void)path;
@@ -987,7 +1053,8 @@ std::string PspApp::settingsPath() const {
 
 void PspApp::adjustSetting(int row, int delta) {
     switch(row) {
-    case 0: settings.scaling=(VideoScaling)(((int)settings.scaling+delta+3)%3); pspFrame.clear(); break;
+    case 0: settings.scaling=(VideoScaling)(((int)settings.scaling+delta+3)%3); gamePresentation.clear(); break;
+    case 9: settings.smoothing=!settings.smoothing; gamePresentation.clear(); break;
     case 1: settings.frameSkip=(FrameSkip)(((int)settings.frameSkip+delta+3)%3); renderCadence.reset(); break;
     case 2: settings.volume=(u32)std::max(0,std::min(100,(int)settings.volume+delta*10)); emulator.audio.setVolume(settings.volume); break;
     case 3: settings.showFps=!settings.showFps; displayFps.reset(); gameBackgroundDirty[0]=gameBackgroundDirty[1]=true; break;
@@ -1021,10 +1088,10 @@ void PspApp::drawSettingsFrame() {
     drawMenuRect(24,18,3,22,accent());
     drawMenuName(38,20,tr("Settings"),uiColor(0xffedf3f6),230);
     drawMenuName(250,20,buildVersion(),uiColor(0xff8e9aaa),472);
-    const char* labels[]={"Scaling","Frame skip","Volume","Show FPS","Language","Theme color","System info","About","Appearance"};
+    const char* labels[]={"Scaling","Frame skip","Volume","Show FPS","Language","Theme color","System info","About","Appearance","Filtering"};
     char volume[16];snprintf(volume,sizeof(volume),"%u",(unsigned)settings.volume);
     const char* values[]={tr(scalingName(settings.scaling)),tr(frameSkipName(settings.frameSkip)),volume,
-        tr(settings.showFps?"On":"Off"),language.name(),tr(themeName(settings.theme)),tr("Open"),tr("Open"),tr(settings.lightAppearance?"Light":"Dark")};
+        tr(settings.showFps?"On":"Off"),language.name(),tr(themeName(settings.theme)),tr("Open"),tr("Open"),tr(settings.lightAppearance?"Light":"Dark"),tr(settings.smoothing?"Smooth":"Sharp")};
     const char* categories[]={"Display","Sound","Interface","System"};
     drawMenuRect(20,48,96,182,surfaceColor());
     drawMenuRect(128,48,1,182,selectionColor());
@@ -1039,15 +1106,17 @@ void PspApp::drawSettingsFrame() {
     drawMenuName(148,54,tr(categories[settingsCategory]),uiColor(0xff8e9aaa),452);
     for(unsigned i=0;i<kSettingsCounts[settingsCategory];++i) {
         unsigned row=kSettingsRows[settingsCategory][i];
-        int y=82+i*48;bool focused=settingsDetail && row==settingsIndex;
-        drawMenuRect(144,y,312,43,focused?selectionColor():surfaceColor());
-        if(focused)drawMenuRect(144,y,3,43,accent());
-        drawMenuName(156,y+((row==6 || row==7)?14:4),tr(labels[row]),focused?accent():uiColor(0xffedf3f6),444);
-        if(focused && (row<6 || row==8)) {
-            drawMenuName(152,y+24,"←",accent(),170);
-            drawMenuName(436,y+24,"→",accent(),454);
+        const bool compact=kSettingsCounts[settingsCategory]>3;
+        const int valueY=compact?18:24;
+        int y=(compact?76:82)+i*(compact?38:48);bool focused=settingsDetail && row==settingsIndex;
+        drawMenuRect(144,y,312,compact?35:43,focused?selectionColor():surfaceColor());
+        if(focused)drawMenuRect(144,y,3,compact?35:43,accent());
+        drawMenuName(156,y+((row==6 || row==7)?14:(compact?1:4)),tr(labels[row]),focused?accent():uiColor(0xffedf3f6),444);
+        if(focused && (row<6 || row==8 || row==9)) {
+            drawMenuName(152,y+valueY,"←",accent(),170);
+            drawMenuName(436,y+valueY,"→",accent(),454);
         }
-        if(row!=6 && row!=7)drawMenuName(176,y+24,values[row],uiColor(0xffcad3de),row==5?336:428);
+        if(row!=6 && row!=7)drawMenuName(176,y+valueY,values[row],uiColor(0xffcad3de),row==5?336:428);
         if(row==5)for(int c=0;c<5;++c) {
             int x=342+c*18;
             if(c==settings.theme)drawMenuRect(x-1,y+24,14,14,uiColor(0xffedf3f6));
@@ -1147,6 +1216,7 @@ void PspApp::loadSelectedGame() {
         return;
     }
     const std::string& candidate = gamePaths[selectedIndex];
+    gameSpikes = GameSpikeWindow();
     pspLog("loadSelectedGame: load begin %s", candidate.c_str());
     clearAudioQueue();
     emulator.loadProgress.callback=&PspApp::loadingCallback;
@@ -1166,9 +1236,7 @@ void PspApp::loadSelectedGame() {
         coreTickCounter = 0;
         renderCadence.reset();
         previousButtons = 0;
-        pspFrame.clear();
-        pspFrameWidth = 0;
-        pspFrameHeight = 0;
+        gamePresentation.release();
         clearAudioQueue();
         pspLog("loadSelectedGame: load ok size=%ux%u fb=%u",
                (unsigned)emulator.gameWidth(),

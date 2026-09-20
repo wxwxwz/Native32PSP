@@ -5,11 +5,19 @@
 #include <algorithm>
 #include <stdio.h>
 #include <utility>
-#ifdef PSP
+#if defined(PSP) || defined(N32_TEST_CORE_PROFILE)
 #include <pspkernel.h>
 #endif
 
 namespace n32 {
+
+static u32 tickProfileClock() {
+#if defined(PSP) || defined(N32_TEST_CORE_PROFILE)
+    return sceKernelGetSystemTimeLow();
+#else
+    return 0;
+#endif
+}
 
 u16 timelineSoundValue(u16 index, s16 loopCount) {
     u16 repeat = 0;
@@ -128,6 +136,9 @@ Emulator::Emulator()
 }
 
 bool Emulator::loadFromPath(const std::string& path, u32 volume) {
+    logMpegProfile();
+    frameChanged=false;
+    std::vector<std::string>().swap(movieFrameNames);
     contentError.clear();
     loadProgress.report("Opening game",path);
     if (isZipFile(path)) {
@@ -147,6 +158,7 @@ bool Emulator::loadFromPath(const std::string& path, u32 volume) {
     audio.stopAll();
     videoPlayer.reset();
     cutsceneAudio.reset();
+    releaseVideoFrame();
     std::vector<float>().swap(cutsceneAudioFrame.interleaved);
     reader.setData(std::vector<u8>());
     renderer.clearSpriteOverrides();
@@ -198,6 +210,18 @@ bool Emulator::reloadFromPath(const std::string& path) {
 
 void Emulator::setButtons(const std::vector<u16>& keycodes) {
     input.setButtons(keycodes);
+    profileInputMask = 0;
+    for (u16 key : keycodes) {
+        switch (key) {
+        case KeyLeft: profileInputMask |= 1; break;
+        case KeyRight: profileInputMask |= 2; break;
+        case KeyUp: profileInputMask |= 4; break;
+        case KeyDown: profileInputMask |= 8; break;
+        case KeyA: profileInputMask |= 16; break;
+        case KeyB: profileInputMask |= 32; break;
+        default: profileInputMask |= 64; break;
+        }
+    }
 }
 
 void Emulator::loadFrame(u32 frame) {
@@ -216,6 +240,11 @@ void Emulator::loadFrame(u32 frame) {
 }
 
 void Emulator::tick(bool renderFrame) {
+    frameChanged=false;
+    lastDrawMicros=0;
+    lastGameProfile = GameTickProfile();
+    vm.resetProfile();
+    audio.resetProfile();
     if(tickCount==0)loadProgress.report("Preparing scene",filename);
     ++tickCount;
 
@@ -229,6 +258,9 @@ void Emulator::tick(bool renderFrame) {
         return;
     }
 
+    lastGameProfile.tick = tickCount;
+    lastGameProfile.inputMask = profileInputMask;
+    u32 phaseBegin = tickProfileClock();
     framePlayer.tick();
     if (framePlayer.hasPendingFrame()) {
         u32 next = framePlayer.takeNextFrame();
@@ -248,24 +280,47 @@ void Emulator::tick(bool renderFrame) {
         }
     }
 
+    u32 phaseEnd = tickProfileClock();
+    lastGameProfile.timelineMicros = phaseEnd - phaseBegin;
+    phaseBegin = phaseEnd;
     processMovieFrames();
+    phaseEnd = tickProfileClock();
+    lastGameProfile.movieMicros = phaseEnd - phaseBegin;
+    phaseBegin = phaseEnd;
     handleButtons();
+    phaseEnd = tickProfileClock();
+    lastGameProfile.buttonMicros = phaseEnd - phaseBegin;
+    lastGameProfile.frame = framePlayer.currentFrame;
+    // A pending scene load replaces VM/audio objects; keep this tick's work
+    // before that replacement. Loading ticks are excluded from steady peaks.
+    lastGameProfile.vm = vm.profile;
+    lastGameProfile.sound = audio.profile;
 
+    phaseBegin = tickProfileClock();
     processPendingContent();
+    phaseEnd = tickProfileClock();
+    lastGameProfile.pendingMicros = phaseEnd - phaseBegin;
 
+    phaseBegin = phaseEnd;
     applyCheats();
+    phaseEnd = tickProfileClock();
+    lastGameProfile.cheatMicros = phaseEnd - phaseBegin;
     if (renderFrame) drawCurrentFrame();
+    lastGameProfile.drawMicros = lastDrawMicros;
+    lastGameProfile.rendered = frameChanged;
     timeMs += 1000 / 30;
 }
 
 void Emulator::processMovieFrames() {
-    std::vector<std::string> names;
-    names.reserve(sprites.sprites.size());
+    size_t nameCount = 0;
     for (SpriteMap::const_iterator it = sprites.sprites.begin(); it != sprites.sprites.end(); ++it) {
-        names.push_back(it->first);
+        if (nameCount == movieFrameNames.size()) movieFrameNames.push_back(it->first);
+        else movieFrameNames[nameCount] = it->first;
+        ++nameCount;
     }
+    const std::vector<std::string>& names = movieFrameNames;
 
-    for (size_t i = 0; i < names.size(); ++i) {
+    for (size_t i = 0; i < nameCount; ++i) {
         MovieState* movie = sprites.getMutable(names[i]);
         if (!movie) {
             continue;
@@ -288,7 +343,7 @@ void Emulator::processMovieFrames() {
         }
     }
 
-    for (size_t i = 0; i < names.size(); ++i) {
+    for (size_t i = 0; i < nameCount; ++i) {
         MovieState* movie = sprites.getMutable(names[i]);
         if (!movie || !movie->hasNextFrame) {
             continue;
@@ -361,10 +416,20 @@ void Emulator::applyCheats() {
 }
 
 void Emulator::drawCurrentFrame() {
+    const u32 begin = tickProfileClock();
     renderer.drawFrame(&reader, sprites, curFrameObjects);
+    releaseVideoFrame();
+    lastDrawMicros = tickProfileClock() - begin;
+    frameChanged=true;
 }
 
 void Emulator::reset() {
+    logMpegProfile();
+    frameChanged=false;
+    lastDrawMicros=0;
+    lastGameProfile = GameTickProfile();
+    profileInputMask = 0;
+    std::vector<std::string>().swap(movieFrameNames);
     tickCount = 0;
     timeMs = 0;
     sprites.clear();
@@ -373,6 +438,7 @@ void Emulator::reset() {
     pendingVideos.clear();
     videoPlayer.reset();
     cutsceneAudio.reset();
+    releaseVideoFrame();
     std::vector<float>().swap(cutsceneAudioFrame.interleaved);
     contentError.clear();
     audio.stopAll();
@@ -394,7 +460,21 @@ bool Emulator::switchContent(const std::string& content) {
 }
 
 const std::vector<u32>& Emulator::framebuffer() const {
-    return renderer.buffer;
+    return displayVideoFrame ? videoFrameBuffer : renderer.buffer;
+}
+
+u32 Emulator::framebufferWidth() const {
+    return displayVideoFrame ? videoFrameWidth : gameWidth();
+}
+
+u32 Emulator::framebufferHeight() const {
+    return displayVideoFrame ? videoFrameHeight : gameHeight();
+}
+
+void Emulator::releaseVideoFrame() {
+    displayVideoFrame = false;
+    videoFrameWidth = videoFrameHeight = 0;
+    if (!videoFrameBuffer.empty()) std::vector<u32>().swap(videoFrameBuffer);
 }
 
 std::vector<s16> Emulator::pendingAudioSamples() {
@@ -515,9 +595,8 @@ std::string Emulator::getProperty(const std::string& target, ActionProp prop) {
         }
         return intToString((s64)movie->frame + (movie->playing ? 2 : 1));
     case ActionPropTotalFrames: {
-        std::vector<MovieFrame> frames;
-        reader.getMovie(movie->movie, &frames);
-        return intToString((s64)frames.size());
+        const std::vector<MovieFrame>* frames = reader.getMovieRef(movie->movie);
+        return intToString(frames ? (s64)frames->size() : 0);
     }
     case ActionPropName:
         return target;
@@ -664,6 +743,7 @@ bool Emulator::isCutsceneActive() const {
 
 bool Emulator::skipCutscene() {
     if (!isCutsceneActive()) return false;
+    logMpegProfile();
     if (videoPlayer) {
         pspLog("cutscene: user skipped '%s'", activeVideoName.c_str());
     } else {
@@ -679,6 +759,7 @@ bool Emulator::skipCutscene() {
     // Consume the pending destination now; don't run the old scene's actions
     // for another tick (which could enqueue the intro again).
     processPendingContent();
+    if (!isCutsceneActive() && contentError.empty() && tickCount != 0) drawCurrentFrame();
     return true;
 }
 
@@ -712,11 +793,10 @@ void Emulator::cutsceneTick(bool renderFrame) {
         }
     }
 
-    size_t w = renderer.width;
-    size_t h = renderer.height;
-#ifdef PSP
-    const u64 audioBegin = sceKernelGetSystemTimeWide();
-#endif
+    size_t w, h;
+    mpeg::videoOutputSize(videoPlayer->width(), videoPlayer->height(), &w, &h);
+    const u32 audioBegin = tickProfileClock();
+    u32 audioFrames = 0;
     // Decode at most two MP2 frames per tick; avoid a multi-second blocking
     // decode of the entire track before the first video frame is shown.
     for (unsigned i = 0; cutsceneAudio && i < 2 &&
@@ -728,32 +808,39 @@ void Emulator::cutsceneTick(bool renderFrame) {
             break;
         }
         audio.appendPcmStream(cutsceneAudioFrame.interleaved, 2, rate, false);
+        ++audioFrames;
     }
-#ifdef PSP
-    const u64 videoBegin = sceKernelGetSystemTimeWide();
-#endif
-    videoPlayer->advanceAndRender(1.0 / 30.0, renderFrame ? &renderer.buffer : 0, w, h);
-#ifdef PSP
-    static u64 audioMicros = 0, videoMicros = 0, maxMicros = 0;
-    static u64 decodeMicros = 0, rgbMicros = 0;
-    static unsigned measuredTicks = 0;
-    const u64 end = sceKernelGetSystemTimeWide();
-    audioMicros += videoBegin - audioBegin;
-    videoMicros += end - videoBegin;
-    decodeMicros += videoPlayer->decodeMicros();
-    rgbMicros += videoPlayer->rgbMicros();
-    maxMicros = std::max(maxMicros, end - audioBegin);
-    if (++measuredTicks == 60) {
-        pspLog("mpeg: ticks=60 audio_avg_us=%u video_rgb_avg_us=%u decode_avg_us=%u rgb_avg_us=%u max_us=%u skipped_b=%u",
-               (unsigned)(audioMicros / 60), (unsigned)(videoMicros / 60),
-               (unsigned)(decodeMicros / 60), (unsigned)(rgbMicros / 60), (unsigned)maxMicros,
-               videoPlayer->skippedFrames());
-        measuredTicks = 0;
-        audioMicros = videoMicros = maxMicros = 0;
-        decodeMicros = rgbMicros = 0;
+    const u32 videoBegin = tickProfileClock();
+    frameChanged=videoPlayer->advanceAndRender(1.0 / 30.0, renderFrame ? &videoFrameBuffer : 0, w, h);
+    if (frameChanged) {
+        videoFrameWidth = (u32)w;
+        videoFrameHeight = (u32)h;
+        displayVideoFrame = true;
     }
-#endif
+    const u32 end = tickProfileClock();
+    const mpeg::AdvanceDiagnostics& advance = videoPlayer->advanceDiagnostics();
+    ++mpegProfile.ticks;
+    mpegProfile.audioFrames += audioFrames;
+    mpegProfile.slots += advance.slotsAdvanced;
+    mpegProfile.rgbFrames += advance.wroteRgb ? 1 : 0;
+    mpegProfile.skipped += advance.pictures.skippedB;
+    mpegProfile.skippedCumulative = videoPlayer->skippedFrames();
+    mpegProfile.audioMicros += videoBegin - audioBegin;
+    mpegProfile.videoMicros += end - videoBegin;
+    mpegProfile.decodeMicros += advance.decodeMicros;
+    mpegProfile.rgbMicros += advance.rgbMicros;
+    if (mpegProfile.ticks == 1 || end - audioBegin > mpegProfile.maxMicros) {
+        mpegProfile.maxMicros = end - audioBegin;
+        mpegProfile.peakAudioMicros = videoBegin - audioBegin;
+        mpegProfile.peakVideoMicros = end - videoBegin;
+        mpegProfile.peakAudioFrames = audioFrames;
+        mpegProfile.peakTick = tickCount;
+        mpegProfile.peakAt = end;
+        mpegProfile.peak = advance;
+    }
+    if (mpegProfile.ticks == 60) logMpegProfile();
     if (videoPlayer->isFinished()) {
+        logMpegProfile();
         pspLog("cutscene: '%s' finished after %.2fs, %u queued",
                activeVideoName.c_str(), videoPlayer->elapsed(),
                (unsigned)pendingVideos.size());
@@ -766,7 +853,29 @@ void Emulator::cutsceneTick(bool renderFrame) {
     }
 }
 
+void Emulator::logMpegProfile() {
+    if (!mpegProfile.ticks) return;
+    const MpegProfileWindow& p = mpegProfile;
+    const mpeg::AdvanceDiagnostics& a = p.peak;
+    const mpeg::DecodeDiagnostics& d = a.pictures;
+    pspLog("mpeg: ticks=%u audio_avg_us=%u video_rgb_avg_us=%u decode_avg_us=%u rgb_avg_us=%u max_us=%u skipped_b=%u audio_frames=%u slots=%u rgb_frames=%u skipped_delta=%u\n"
+           "mpeg_peak: at_us=%u tick=%llu audio_us=%u video_us=%u audio_frames=%u decode_us=%u rgb_us=%u calls=%u slots=%u output=%u caller_reduce=%u budget_reduce=%u wrote_rgb=%u I=%u/%u/%u P=%u/%u/%u B=%u/%u/%u other=%u/%u/%u skip=%u/%u/%u (attempts/total_us/max_us)",
+           p.ticks,(unsigned)(p.audioMicros/p.ticks),(unsigned)(p.videoMicros/p.ticks),
+           (unsigned)(p.decodeMicros/p.ticks),(unsigned)(p.rgbMicros/p.ticks),p.maxMicros,p.skippedCumulative,
+           p.audioFrames,p.slots,p.rgbFrames,p.skipped,p.peakAt,(unsigned long long)p.peakTick,
+           p.peakAudioMicros,p.peakVideoMicros,p.peakAudioFrames,a.decodeMicros,a.rgbMicros,a.decodeCalls,a.slotsAdvanced,
+           a.outputRequested?1u:0u,a.callerReduce?1u:0u,a.budgetReduce?1u:0u,a.wroteRgb?1u:0u,
+           d.pictureAttempts[1],d.pictureMicros[1],d.pictureMaxMicros[1],
+           d.pictureAttempts[2],d.pictureMicros[2],d.pictureMaxMicros[2],
+           d.pictureAttempts[3],d.pictureMicros[3],d.pictureMaxMicros[3],
+           d.pictureAttempts[0],d.pictureMicros[0],d.pictureMaxMicros[0],
+           d.skippedB,d.skipMicros,d.skipMaxMicros);
+    mpegProfile = MpegProfileWindow();
+}
+
 bool Emulator::startVideo(const std::string& name) {
+    // A short clip must never share its partial window with the next clip.
+    logMpegProfile();
     loadProgress.report("Opening video",name);
     pspLog("startVideo: opening '%s'", name.c_str());
     std::string path;
@@ -787,8 +896,12 @@ bool Emulator::startVideo(const std::string& name) {
         cutsceneAudio.reset(new mpeg::Audio(mpeg::Buffer(audioSource)));
         if(!cutsceneAudio->hasHeader())cutsceneAudio.reset();
     }
-    pspLog("startVideo: file streaming, bounded compressed buffers, audio=%uHz",
-           cutsceneAudio?(unsigned)cutsceneAudio->sampleRate():0u);
+    size_t outputW, outputH;
+    mpeg::videoOutputSize(player->width(), player->height(), &outputW, &outputH);
+    pspLog("startVideo: file streaming, bounded compressed buffers, audio=%uHz source=%ux%u rgb=%ux%u",
+           cutsceneAudio?(unsigned)cutsceneAudio->sampleRate():0u,
+           (unsigned)player->width(), (unsigned)player->height(),
+           (unsigned)outputW, (unsigned)outputH);
     pspLog("startVideo: playing '%s'", name.c_str());
     videoPlayer = std::move(player);
     hasActiveVideo = true;

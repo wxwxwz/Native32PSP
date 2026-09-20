@@ -85,6 +85,15 @@ struct RgbaImage {
     std::vector<u32> pixels;
 };
 
+// Bounds of nonzero-alpha pixels in an immutable decoded image.
+// Right/bottom are exclusive; transparent holes keep normal blitting.
+struct ImageDrawInfo {
+    u32 left, top, right, bottom;
+    bool allPixelsVisible;
+    ImageDrawInfo() : left(0), top(0), right(0), bottom(0), allPixelsVisible(false) {}
+};
+ImageDrawInfo imageDrawInfo(const RgbaImage& image);
+
 struct FrameObject {
     ObjectType type;
     u16 index;

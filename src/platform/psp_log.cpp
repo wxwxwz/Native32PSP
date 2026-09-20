@@ -31,7 +31,9 @@ void pspLogReset() {
 }
 
 void pspLog(const char* fmt, ...) {
-    char buffer[1024];
+    // The five-second snapshot includes one correlated game/VM/sound peak.
+    // Keep it in one storage transaction without truncating its final rows.
+    char buffer[4096];
     va_list args;
     va_start(args, fmt);
     int length = vsnprintf(buffer, sizeof(buffer) - 2, fmt, args);

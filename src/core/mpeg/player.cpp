@@ -26,11 +26,16 @@ bool VideoPlayer::valid() const {
     return headerOk;
 }
 
-void VideoPlayer::advanceAndRender(double seconds, std::vector<u32>* buffer, size_t width, size_t height,
+bool VideoPlayer::advanceAndRender(double seconds, std::vector<u32>* buffer, size_t width, size_t height,
                                   bool reduceWork) {
+    bool wroteImage = false;
+    lastAdvance = AdvanceDiagnostics();
+    lastAdvance.outputRequested = buffer != 0;
+    lastAdvance.callerReduce = reduceWork;
 #ifdef PSP
     unsigned begin = sceKernelGetSystemTimeLow();
-    reduceWork = reduceWork || workBudget.reduceWork();
+    lastAdvance.budgetReduce = workBudget.reduceWork();
+    reduceWork = reduceWork || lastAdvance.budgetReduce;
 #endif
     if (!finished) {
         time += seconds;
@@ -38,10 +43,13 @@ void VideoPlayer::advanceAndRender(double seconds, std::vector<u32>* buffer, siz
         while (framesShown <= target) {
             size_t index = 0;
             bool skipped = false;
-            if (!video.decode(&index, reduceWork || !buffer || framesShown < target, &skipped)) {
+            ++lastAdvance.decodeCalls;
+            if (!video.decode(&index, reduceWork || !buffer || framesShown < target, &skipped,
+                              &lastAdvance.pictures)) {
                 finished = true;
                 break;
             }
+            ++lastAdvance.slotsAdvanced;
             if (skipped) {
                 ++skippedBFrames;
             } else {
@@ -63,6 +71,7 @@ void VideoPlayer::advanceAndRender(double seconds, std::vector<u32>* buffer, siz
         const Frame* frame = video.frame(currentFrame);
         if (frame) {
             frame->writeRgbScaled(buffer, width, height);
+            wroteImage = true;
             imageDirty = false;
             renderedBuffer = buffer;
             renderedPixels = buffer->data();
@@ -74,6 +83,10 @@ void VideoPlayer::advanceAndRender(double seconds, std::vector<u32>* buffer, siz
     lastRgbMicros = sceKernelGetSystemTimeLow() - decoded;
     workBudget.observe(lastDecodeMicros + lastRgbMicros);
 #endif
+    lastAdvance.decodeMicros = lastDecodeMicros;
+    lastAdvance.rgbMicros = lastRgbMicros;
+    lastAdvance.wroteRgb = wroteImage;
+    return wroteImage;
 }
 
 bool VideoPlayer::isFinished() const {

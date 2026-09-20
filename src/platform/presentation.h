@@ -2,6 +2,9 @@
 #define N32_PRESENTATION_H
 #include "platform/psp_settings.h"
 namespace n32 {
+inline VideoScaling videoScaling(u32 w,u32 h) {
+    return w>480 || h>272 ? ScaleFit : ScaleOriginal;
+}
 inline void scaledSize(u32 w,u32 h,VideoScaling mode,u32* outW,u32* outH) {
     if(!w || !h) {*outW=*outH=0;return;}
     if(mode==ScaleFull) {*outW=480;*outH=272;}

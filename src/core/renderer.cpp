@@ -1,7 +1,15 @@
 #include "core/renderer.h"
 #include <algorithm>
+#include <cstring>
 
 namespace n32 {
+
+static bool intersectsCanvas(s64 x, s64 y, u32 imageWidth, u32 imageHeight, u32 width, u32 height) {
+    return imageWidth && imageHeight && width && height &&
+           imageWidth <= 0x7fffffffu && imageHeight <= 0x7fffffffu &&
+           width <= 0x7fffffffu && height <= 0x7fffffffu &&
+           x < (s64)width && y < (s64)height && x + imageWidth > 0 && y + imageHeight > 0;
+}
 
 Renderer::Renderer() : screenX(0), screenY(0), width(320), height(240) {
     buffer.assign(width * height, 0xff000000u);
@@ -24,6 +32,7 @@ void Renderer::clearSpriteOverrides() {
 void Renderer::setSpriteOverride(const std::string& name, const RgbaImage& image, const std::string& visibilityLeader) {
     SpriteOverride overrideImage;
     overrideImage.image = image;
+    overrideImage.drawInfo = imageDrawInfo(image);
     overrideImage.hasVisibilityLeader = true;
     overrideImage.visibilityLeader = visibilityLeader;
     spriteOverrides[name] = overrideImage;
@@ -32,6 +41,7 @@ void Renderer::setSpriteOverride(const std::string& name, const RgbaImage& image
 void Renderer::setSpriteOverride(const std::string& name, const RgbaImage& image) {
     SpriteOverride overrideImage;
     overrideImage.image = image;
+    overrideImage.drawInfo = imageDrawInfo(image);
     overrideImage.hasVisibilityLeader = false;
     spriteOverrides[name] = overrideImage;
 }
@@ -41,8 +51,8 @@ size_t Renderer::spriteOverrideCount() const {
 }
 
 void Renderer::drawFrame(Native32Reader* reader, const SpriteSystem& sprites, const std::vector<FrameObject>& curFrame) {
-    std::fill(buffer.begin(), buffer.end(), 0xff000000u);
     if (!reader) {
+        std::fill(buffer.begin(), buffer.end(), 0xff000000u);
         return;
     }
 
@@ -54,9 +64,16 @@ void Renderer::drawFrame(Native32Reader* reader, const SpriteSystem& sprites, co
     for (size_t i = 0; i < curFrame.size(); ++i) {
         const FrameObject& obj = curFrame[i];
         if (obj.type == ObjectImage) {
+            u32 imageWidth, imageHeight;
+            // Reject offscreen map tiles before sorting. Dimensions are a
+            // read-only lookup: decoding and LRU touches stay in draw order.
+            if (!reader->getImageDimensions(obj.index, &imageWidth, &imageHeight) ||
+                !intersectsCanvas((s64)obj.x + screenX, (s64)obj.y + screenY,
+                                  imageWidth, imageHeight, width, height)) continue;
             DrawEntry entry;
             entry.sourceType = DrawImage;
             entry.overrideImage = 0;
+            entry.overrideInfo = 0;
             entry.imageIndex = obj.index;
             entry.x = obj.x;
             entry.y = obj.y;
@@ -90,15 +107,20 @@ void Renderer::drawFrame(Native32Reader* reader, const SpriteSystem& sprites, co
                 frameX = (*movieFrames)[movie.frame].x;
                 frameY = (*movieFrames)[movie.frame].y;
             }
+            if (!intersectsCanvas((s64)movie.x + frameX + screenX,
+                                  (s64)movie.y + frameY + screenY,
+                                  overrideImage.image.width, overrideImage.image.height,
+                                  width, height)) continue;
 
             DrawEntry entry;
             entry.sourceType = DrawOverride;
             // Overrides are stable map entries for this draw call. Carry the
             // image directly so sorting never copies names or repeats lookups.
             entry.overrideImage = &overrideImage.image;
+            entry.overrideInfo = &overrideImage.drawInfo;
             entry.imageIndex = 0;
-            entry.x = movie.x + frameX;
-            entry.y = movie.y + frameY;
+            entry.x = (s64)movie.x + frameX;
+            entry.y = (s64)movie.y + frameY;
             entry.depth = movie.depth;
             entry.order = order++;
             drawList.push_back(entry);
@@ -108,12 +130,18 @@ void Renderer::drawFrame(Native32Reader* reader, const SpriteSystem& sprites, co
         const std::vector<MovieFrame>* movieFrames = reader->getMovieRef(movie.movie);
         if (movieFrames && movie.frame < movieFrames->size()) {
             const MovieFrame& frame = (*movieFrames)[movie.frame];
+            u32 imageWidth, imageHeight;
+            if (!reader->getImageDimensions(frame.image, &imageWidth, &imageHeight) ||
+                !intersectsCanvas((s64)movie.x + frame.x + screenX,
+                                  (s64)movie.y + frame.y + screenY,
+                                  imageWidth, imageHeight, width, height)) continue;
             DrawEntry entry;
             entry.sourceType = DrawImage;
             entry.overrideImage = 0;
+            entry.overrideInfo = 0;
             entry.imageIndex = frame.image;
-            entry.x = movie.x + frame.x;
-            entry.y = movie.y + frame.y;
+            entry.x = (s64)movie.x + frame.x;
+            entry.y = (s64)movie.y + frame.y;
             entry.depth = movie.depth;
             entry.order = order++;
             drawList.push_back(entry);
@@ -130,24 +158,49 @@ void Renderer::drawFrame(Native32Reader* reader, const SpriteSystem& sprites, co
     };
     std::sort(drawList.begin(), drawList.end(), DrawEntryLess());
 
+    bool initialized = false;
     for (size_t i = 0; i < drawList.size(); ++i) {
         const DrawEntry& entry = drawList[i];
-        s32 x = entry.x + screenX;
-        s32 y = entry.y + screenY;
+        s64 x = entry.x + screenX;
+        s64 y = entry.y + screenY;
+        const RgbaImage* image = 0;
+        const ImageDrawInfo* info = 0;
         if (entry.sourceType == DrawImage) {
-            const RgbaImage* image = reader->getImageRef(entry.imageIndex);
-            if (image) {
-                blitImage(*image, x, y);
-            }
+            // Entry bounds were checked before sorting. This synchronous draw
+            // has no callbacks that change offsets or immutable asset sizes;
+            // an eviction/redecode keeps those dimensions. Touch LRU only here.
+            image = reader->getImageRef(entry.imageIndex, 0, &info);
         } else {
-            if (entry.overrideImage) {
-                blitImage(*entry.overrideImage, x, y);
-            }
+            image = entry.overrideImage;
+            info = entry.overrideInfo;
         }
+        if (!image || !info || info->left >= info->right || info->top >= info->bottom ||
+            x + info->left >= width || y + info->top >= height ||
+            x + info->right <= 0 || y + info->bottom <= 0) continue;
+        if (!initialized) {
+            // Only a complete, opaque first layer can replace the black clear.
+            // Partial/truncated images, holes and empty scenes still clear.
+            const bool coversCanvas = info->allPixelsVisible && x <= 0 && y <= 0 &&
+                x + image->width >= width && y + image->height >= height &&
+                (u64)width * height == buffer.size();
+            if (!coversCanvas) std::fill(buffer.begin(), buffer.end(), 0xff000000u);
+            initialized = true;
+        }
+        blitImage(*image, (s32)x, (s32)y, *info);
     }
+    if (!initialized) std::fill(buffer.begin(), buffer.end(), 0xff000000u);
 }
 
 void Renderer::blitImage(const RgbaImage& image, s32 dstX, s32 dstY) {
+    // Public callers may mutate their pixels between calls. Only stable reader
+    // cache entries and owned sprite overrides carry precomputed pixel bounds.
+    ImageDrawInfo info;
+    info.right = image.width;
+    info.bottom = image.height;
+    blitImage(image, dstX, dstY, info);
+}
+
+void Renderer::blitImage(const RgbaImage& image, s32 dstX, s32 dstY, const ImageDrawInfo& info) {
     if (image.width == 0 || image.height == 0 || width == 0 || height == 0 || buffer.empty()) {
         return;
     }
@@ -163,10 +216,10 @@ void Renderer::blitImage(const RgbaImage& image, s32 dstX, s32 dstY) {
         width > 0x7fffffffu || height > 0x7fffffffu) return;
     const s32 bufferWidth = (s32)width;
     const s32 bufferHeight = (s32)height;
-    const s32 srcX0 = std::max<s32>(0, -dstX);
-    const s32 srcY0 = std::max<s32>(0, -dstY);
-    const s32 srcX1 = (s32)std::min<s64>(image.width, (s64)bufferWidth - dstX);
-    const s32 srcY1 = (s32)std::min<s64>(image.height, (s64)bufferHeight - dstY);
+    const s32 srcX0 = std::max<s32>((s32)info.left, -dstX);
+    const s32 srcY0 = std::max<s32>((s32)info.top, -dstY);
+    const s32 srcX1 = (s32)std::min<s64>(info.right, (s64)bufferWidth - dstX);
+    const s32 srcY1 = (s32)std::min<s64>(info.bottom, (s64)bufferHeight - dstY);
     if (srcX0 >= srcX1 || srcY0 >= srcY1) {
         return;
     }
@@ -187,6 +240,11 @@ void Renderer::blitImage(const RgbaImage& image, s32 dstX, s32 dstY) {
                                                               buffer.size() - dstStart));
         const u32* src = &image.pixels[srcStart];
         u32* dst = &buffer[dstStart];
+
+        if (info.allPixelsVisible) {
+            std::memcpy(dst, src, rowWidth * sizeof(u32));
+            continue;
+        }
 
         // Preserve the original compositing rule: any non-zero alpha pixel
         // replaces the destination, while fully transparent pixels are left

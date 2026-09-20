@@ -10,6 +10,9 @@ static const char* const languageStrings[][2] = {
 {"System","系统"},
 
 {"Scaling","画面缩放"},
+{"Filtering","滤波"},
+{"Sharp","清晰"},
+{"Smooth","平滑"},
 {"Frame skip","跳帧"},
 {"Volume","音量"},
 {"Show FPS","显示帧率"},

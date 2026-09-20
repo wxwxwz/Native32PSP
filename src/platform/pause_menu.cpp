@@ -1,5 +1,6 @@
 #include "platform/psp_app.h"
 #include "platform/menu_font.h"
+#include "platform/psp_log.h"
 #include "core/cheat_file.h"
 #include <pspctrl.h>
 #include <algorithm>
@@ -7,20 +8,23 @@
 
 namespace n32 {
 void PspApp::releaseGame() {
+    gameSpikes = GameSpikeWindow();
     loadingShown=false;loadingStage.clear();std::vector<u32>().swap(loadingPanel);
     emulator.reset();emulator.reader.setData(std::vector<u8>());emulator.cheats.clear();
     closeScreenshots();clearAudioQueue();buttons.clear();
-    std::vector<u32>().swap(pspFrame);pspFrameWidth=pspFrameHeight=0;
+    gamePresentation.release();
+    std::vector<u32>().swap(overlayPixels);
     screenshotNoticeTicks=0;loadedPath.clear();
     gameLoaded=false;pauseMode=cheatMode=false;menuMode=true;
 }
 void PspApp::resumeGame() {
+    pspLog("pause: resume");
     closeScreenshots();
     pauseMode = cheatMode = false;
     suppressedButtons |= previousButtons & (PSP_CTRL_CIRCLE | PSP_CTRL_CROSS | PSP_CTRL_START);
     buttons.clear(); emulator.setButtons(buttons);
     clearAudioQueue(); coreClock.reset(); displayFps.reset(); renderCadence.reset();
-    pspFrame.clear();
+    gamePresentation.clear();
 }
 void PspApp::readPauseMenu(unsigned pressed) {
     if(screenshotMode) {

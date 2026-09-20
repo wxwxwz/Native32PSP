@@ -17,6 +17,18 @@
 
 namespace n32 {
 
+// All fields describe the same core tick. Stage times are disjoint; VM and
+// sound times are nested within timeline/movie/button processing.
+struct GameTickProfile {
+    u64 tick = 0;
+    u32 frame = 0, inputMask = 0;
+    u32 timelineMicros = 0, movieMicros = 0, buttonMicros = 0;
+    u32 pendingMicros = 0, cheatMicros = 0, drawMicros = 0;
+    bool rendered = false;
+    VmTickProfile vm;
+    SoundTickProfile sound;
+};
+
 class Emulator : public VmHost {
 public:
     Emulator();
@@ -27,11 +39,15 @@ public:
     void loadFrame(u32 frame);
     void tick(bool renderFrame = true);
     bool skipCutscene();
+    bool isCutsceneActive() const;
     void drawCurrentFrame();
     void reset();
     bool switchContent(const std::string& filename);
 
     const std::vector<u32>& framebuffer() const;
+    u32 framebufferWidth() const;
+    u32 framebufferHeight() const;
+    bool isVideoFrame() const { return displayVideoFrame; }
     std::vector<s16> pendingAudioSamples();
     void pendingAudioSamples(std::vector<s16>* output);
     u32 audioSampleRate() const;
@@ -70,6 +86,10 @@ public:
     std::vector<FrameObject> curFrameObjects;
     u64 tickCount;
     u32 timeMs;
+    // Whether the current tick actually wrote the framebuffer, including black frames.
+    bool frameChanged=false;
+    u32 lastDrawMicros=0;
+    GameTickProfile lastGameProfile;
     std::vector<std::string> pendingVideos;
     bool autoSkipCutscenes;
     bool hasActiveVideo;
@@ -81,13 +101,31 @@ public:
     LoadProgress loadProgress;
 
 private:
+    // Display state survives decoder EOF and queued clips until another image
+    // is actually written. Game coordinates always remain on renderer/reader.
+    std::vector<u32> videoFrameBuffer;
+    u32 videoFrameWidth = 0, videoFrameHeight = 0;
+    bool displayVideoFrame = false;
+    void releaseVideoFrame();
+    // Own name snapshots across script callbacks. Keep string slots alive so
+    // repeated long names reuse capacity; release them with the current scene.
+    std::vector<std::string> movieFrameNames;
+    u32 profileInputMask = 0;
+    struct MpegProfileWindow {
+        u32 ticks = 0, audioFrames = 0, slots = 0, rgbFrames = 0, skipped = 0;
+        u64 audioMicros = 0, videoMicros = 0, decodeMicros = 0, rgbMicros = 0;
+        u32 maxMicros = 0, peakAudioMicros = 0, peakVideoMicros = 0;
+        u32 peakAudioFrames = 0, peakAt = 0, skippedCumulative = 0;
+        u64 peakTick = 0;
+        mpeg::AdvanceDiagnostics peak;
+    } mpegProfile;
+    void logMpegProfile();
     void handleButtons();
     void applyCheats();
     void processMovieFrames();
     void loadMenuImage(const std::string& spec);
     bool startVideo(const std::string& name);
     void cutsceneTick(bool renderFrame);
-    bool isCutsceneActive() const;
     void processPendingContent();
 };
 

@@ -4,20 +4,22 @@ namespace n32 {
 
 MovieState::MovieState()
     : movie(0), x(0), y(0), depth(0), frame(0), visible(true), playing(true),
-      cloned(false), hasSoundChannel(false), soundChannel(0), hasNextFrame(true), nextFrame(0) {
+      cloned(false), hasSoundChannel(false), soundChannel(0), hasNextFrame(true), nextFrame(0),
+      timelinePresent(false) {
 }
 
 MovieState::MovieState(u32 movieValue, s16 xValue, s16 yValue, u16 depthValue)
     : movie(movieValue), x(xValue), y(yValue), depth(depthValue), frame(0), visible(true),
       playing(true), cloned(false), hasSoundChannel(false), soundChannel(0),
-      hasNextFrame(true), nextFrame(0) {
+      hasNextFrame(true), nextFrame(0), timelinePresent(false) {
 }
 
 SpriteSystem::SpriteSystem() {
 }
 
 void SpriteSystem::updateForFrame(const std::vector<FrameObject>& frameObjects) {
-    std::set<std::string> frameMovieNames;
+    for (SpriteMap::iterator it = sprites.begin(); it != sprites.end(); ++it)
+        it->second.timelinePresent = false;
 
     for (size_t i = 0; i < frameObjects.size(); ++i) {
         const FrameObject& obj = frameObjects[i];
@@ -25,41 +27,37 @@ void SpriteSystem::updateForFrame(const std::vector<FrameObject>& frameObjects) 
             continue;
         }
 
-        if (sprites.find(obj.name) != sprites.end()) {
-            frameMovieNames.insert(obj.name);
+        SpriteMap::iterator named = sprites.find(obj.name);
+        if (named != sprites.end()) {
+            named->second.timelinePresent = true;
             continue;
         }
 
-        std::string renamedInstance;
-        bool foundRenamed = false;
-        for (SpriteMap::const_iterator it = sprites.begin(); it != sprites.end(); ++it) {
+        SpriteMap::iterator renamed = sprites.end();
+        for (SpriteMap::iterator it = sprites.begin(); it != sprites.end(); ++it) {
             const MovieState& movie = it->second;
             if (!movie.cloned && movie.movie == obj.index && movie.depth == obj.depth) {
-                renamedInstance = it->first;
-                foundRenamed = true;
+                renamed = it;
                 break;
             }
         }
 
-        if (foundRenamed) {
-            frameMovieNames.insert(renamedInstance);
+        if (renamed != sprites.end()) {
+            renamed->second.timelinePresent = true;
         } else {
             MovieState state(obj.index, obj.x, obj.y, obj.depth);
             state.hasNextFrame = true;
             state.nextFrame = 0;
+            state.timelinePresent = true;
             sprites[obj.name] = state;
-            frameMovieNames.insert(obj.name);
         }
     }
 
-    std::vector<std::string> toRemove;
-    for (SpriteMap::const_iterator it = sprites.begin(); it != sprites.end(); ++it) {
-        if (!it->second.cloned && frameMovieNames.find(it->first) == frameMovieNames.end()) {
-            toRemove.push_back(it->first);
-        }
-    }
-    for (size_t i = 0; i < toRemove.size(); ++i) {
-        sprites.erase(toRemove[i]);
+    for (SpriteMap::iterator it = sprites.begin(); it != sprites.end();) {
+        if (!it->second.cloned && !it->second.timelinePresent)
+            it = sprites.erase(it);
+        else
+            ++it;
     }
 }
 

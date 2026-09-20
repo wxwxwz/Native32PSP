@@ -3,7 +3,6 @@
 
 #include "core/native32_types.h"
 #include <map>
-#include <set>
 
 namespace n32 {
 
@@ -23,6 +22,12 @@ struct MovieState {
 
     MovieState();
     MovieState(u32 movieValue, s16 xValue, s16 yValue, u16 depthValue);
+
+private:
+    // Transient timeline membership, rebuilt before every update. Keeping this
+    // on the stable map node avoids allocating a set of copied names per frame.
+    bool timelinePresent;
+    friend class SpriteSystem;
 };
 
 typedef std::map<std::string, MovieState> SpriteMap;

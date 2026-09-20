@@ -388,7 +388,8 @@ void Audio::decodeFrame() {
         }
     }
 
-    std::fill(interleaved.begin(), interleaved.end(), 0.0f);
+    // The fixed 3*4*3 synthesis blocks below each write 32 stereo frames,
+    // covering all 2304 output floats even for mono or zero allocations.
     int outPos = 0;
     for (int part = 0; part < 3; ++part) {
         for (int granule = 0; granule < 4; ++granule) {

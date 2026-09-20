@@ -5,6 +5,7 @@
 #include "platform/psp_settings.h"
 #include "platform/frame_clock.h"
 #include "platform/presentation.h"
+#include "platform/game_presentation.h"
 #include "platform/system_info.h"
 #include <string>
 #include <vector>
@@ -35,6 +36,7 @@ private:
     void resumeGame();
     void releaseGame();
     void takeScreenshot();
+    bool captureGameFrame(std::vector<u32>* pixels);
     void browseScreenshots(int direction);
     void drawScreenshots();
     void closeScreenshots();
@@ -56,6 +58,7 @@ private:
     void scanGames();
     void loadSelectedGame();
     void presentFrame(const std::vector<u32>& pixels);
+    void drawGameOverlays(u32* drawBase, unsigned fpsWidth, unsigned fpsHeight, bool notice);
     void drawMenuRect(int x, int y, int w, int h, u32 color);
     void drawLogo(int x, int y);
     void drawMenuChar(int x, int y, char ch, u32 color, int scale);
@@ -124,7 +127,15 @@ private:
     u32 coreTickCounter;
     u32 lastCoreMicros;
     bool lastTransferGe=false;
-    TimingWindow logicTiming,mixTiming,copyTiming,waitTiming,logTiming;
+    TimingWindow logicTiming,mixTiming,copyTiming,prepareTiming,transferTiming,waitTiming,logTiming;
+    TimingWindow drawTiming;
+    struct GameSpikeWindow {
+        unsigned samples = 0, over50ms = 0;
+        u32 peakMicros = 0, peakAt = 0;
+        GameTickProfile slowest;
+        char scene[96] = {};
+    } gameSpikes;
+    void recordGameProfile(u32 micros, u32 at);
     DisplayFps displayFps;
     unsigned fpsPanelWidth[2]={0,0};
     unsigned fpsPanelHeight[2]={0,0};
@@ -133,9 +144,9 @@ private:
     std::vector<std::string> gamePaths;
     unsigned int selectedIndex;
     std::vector<u32> menuFrame;
-    std::vector<u32> pspFrame;
-    u32 pspFrameWidth;
-    u32 pspFrameHeight;
+    std::vector<u32> overlayPixels;
+    GamePresentation menuPresentation;
+    GamePresentation gamePresentation;
     bool gameBackgroundDirty[2];
     std::vector<u16> buttons;
     Emulator emulator;

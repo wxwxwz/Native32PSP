@@ -69,6 +69,7 @@ private:
 };
 
 std::shared_ptr<ByteSource> openProgramStream(const std::string& path,int packetType);
+std::shared_ptr<ByteSource> openProgramStream(std::shared_ptr<ByteSource> input,int packetType);
 
 DemuxedStreams demuxAll(std::vector<u8> data, const LoadProgress& progress=LoadProgress(), const std::string& path="");
 

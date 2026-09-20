@@ -41,15 +41,39 @@ public:
     virtual void runFrameActions(u32 frame) = 0;
 };
 
+// Per-tick diagnostics: recursive calls contribute instructions/calls/depth,
+// while wall time is charged only to their outermost run. Targets own no heap.
+struct VmTickProfile {
+    u32 calls, instructions, maxDepth, maxMicros, slowAction;
+    u64 totalMicros;
+    char slowTarget[48];
+    VmTickProfile()
+        : calls(0), instructions(0), maxDepth(0), maxMicros(0), slowAction(0),
+          totalMicros(0), slowTarget() {}
+};
+
 class ActionVM {
 public:
     ActionVM();
 
     void run(Native32Reader* reader, VmHost* host, u32 index, const std::string& target);
     u32 randomBelow(u32 upper);
+    void resetProfile();
 
     std::map<std::string, std::string> vars;
     u64 rngState;
+    VmTickProfile profile;
+
+private:
+    struct RunProfileScope;
+    // A copied/reloaded VM must never inherit pointers to another run's stack.
+    // This leaves the existing automatic copy/move of script state intact.
+    struct ProfileNesting {
+        RunProfileScope* active;
+        ProfileNesting() : active(0) {}
+        ProfileNesting(const ProfileNesting&) : active(0) {}
+        ProfileNesting& operator=(const ProfileNesting&) { active = 0; return *this; }
+    } profileNesting;
 };
 
 double strToFloat(const std::string& value);

@@ -11,25 +11,45 @@ class RenderCadence {
 public:
     RenderCadence() { reset(); }
     void reset() { interval = 1; phase = 0; renderedCost = skippedCost = 0;
-        haveRendered = haveSkipped = false; pressure = recovery = 0; }
+        haveRendered = haveSkipped = false; pressure = recovery = 0;
+        pressureDebt = cycleCost = cycleSamples = 0; }
     bool next() { bool draw = phase == 0; phase = (phase + 1) % interval; return draw; }
     void observe(bool rendered, u32 micros) {
         // Ignore pathological load times when estimating steady-state cost.
         if (micros > 200000) micros = 200000;
+        // Normally a draw spans at most three opportunities with two ticks
+        // each. Bound partial cycles even if a caller suppresses more draws.
+        if (cycleSamples == 8) {
+            cycleCost = cycleSamples = pressureDebt = pressure = 0;
+        }
+        cycleCost += micros;
+        ++cycleSamples;
         u32& average = rendered ? renderedCost : skippedCost;
         bool& known = rendered ? haveRendered : haveSkipped;
         average = known ? (average * 7 + micros) / 8 : micros;
         known = true;
         if (!rendered) return;
-        u32 current = (renderedCost + (interval - 1) * skippedCost) / interval;
+        // Count fresh over-budget cycles, not repeated echoes of one spike in
+        // the EMA. Cheap cycles repay work, but do not erase recurring overload
+        // unless they repay all of it. Include every skipped catch-up tick.
+        const u32 budget = cycleSamples * 30000;
+        if (cycleCost > budget) {
+            const u32 excess = cycleCost - budget, limit = 4800000;
+            pressureDebt = excess >= limit - pressureDebt ? limit : pressureDebt + excess;
+            if (pressure < 3) ++pressure;
+        } else {
+            const u32 credit = budget - cycleCost;
+            pressureDebt = credit >= pressureDebt ? 0 : pressureDebt - credit;
+            if (!pressureDebt) pressure = 0;
+        }
+        cycleCost = cycleSamples = 0;
         u32 faster = interval > 1 ?
-            (renderedCost + (interval - 2) * skippedCost) / (interval - 1) : current;
-        pressure = current > 30000 ? pressure + 1 : 0;
+            (renderedCost + (interval - 2) * skippedCost) / (interval - 1) : renderedCost;
         recovery = faster < 24000 ? recovery + 1 : 0;
         if (pressure >= 3 && interval < 3) {
-            ++interval; phase = 1; pressure = recovery = 0;
+            ++interval; phase = 1; pressure = recovery = pressureDebt = 0;
         } else if (recovery >= 30 && interval > 1) {
-            --interval; phase = 0; pressure = recovery = 0;
+            --interval; phase = 0; pressure = recovery = pressureDebt = 0;
         }
         // Saturate counters during sustained overload/idle.
         if (pressure > 3) pressure = 3;
@@ -38,7 +58,7 @@ public:
     unsigned period() const { return interval; }
 private:
     unsigned interval, phase, pressure, recovery;
-    u32 renderedCost, skippedCost;
+    u32 renderedCost, skippedCost, pressureDebt, cycleCost, cycleSamples;
     bool haveRendered, haveSkipped;
 };
 

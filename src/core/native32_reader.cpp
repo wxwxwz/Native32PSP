@@ -9,8 +9,35 @@
 #include <string.h>
 #include <stdlib.h>
 #include <zlib.h>
+#ifdef PSP
+#include <pspkernel.h>
+#endif
 
 namespace n32 {
+
+ImageDrawInfo imageDrawInfo(const RgbaImage& image) {
+    ImageDrawInfo info;
+    if (!image.width || !image.height) return info;
+    const u64 total = (u64)image.width * image.height;
+    const size_t count = (size_t)std::min<u64>(total, image.pixels.size());
+    info.left = image.width;
+    info.top = image.height;
+    // A truncated opaque prefix cannot prove that an image covers the canvas.
+    info.allPixelsVisible = count == total;
+    u32 x = 0, y = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (image.pixels[i] & 0xff000000u) {
+            info.left = std::min(info.left, x);
+            info.top = std::min(info.top, y);
+            info.right = std::max(info.right, x + 1);
+            info.bottom = std::max(info.bottom, y + 1);
+        } else {
+            info.allPixelsVisible = false;
+        }
+        if (++x == image.width) { x = 0; ++y; }
+    }
+    return info;
+}
 
 static bool fileRange(size_t size, u64 start, size_t count, size_t* offset) {
     if (start > size || count > size - (size_t)start) return false;
@@ -63,6 +90,7 @@ void Native32Reader::setData(std::vector<u8> fileData) {
     imageLastUsed.clear();
     cachedImageBytes = 0;
     imageClock = imageEvictions = 0;
+    decodedImages = decodePeakMicros = 0; decodeMicros = 0;
     imageValidCache.clear();
     framesCache.clear();
     moviesCache.clear();
@@ -286,14 +314,20 @@ bool Native32Reader::disassembleAction(u32 index, ActionEntry* out) const {
 }
 
 bool Native32Reader::getAction(u32 index, ActionEntry* out) {
-    if (index == 0 || !out) {
-        return false;
-    }
+    if (!out) return false;
+    const ActionEntry* entry = getActionRef(index);
+    if (!entry) return false;
+    *out = *entry;
+    return true;
+}
+
+const ActionEntry* Native32Reader::getActionRef(u32 index) {
+    if (index == 0) return 0;
     // A negative branch can wrap to UINT_MAX. Never grow the cache for an
     // index that cannot fit in the file (subtractions avoid 32-bit wrap).
-    if (base > data.size() || actionIdx > data.size() - base) return false;
+    if (base > data.size() || actionIdx > data.size() - base) return 0;
     const size_t available = data.size() - base - actionIdx;
-    if (available < 8 || (size_t)(index - 1) > (available - 8) / 8) return false;
+    if (available < 8 || (size_t)(index - 1) > (available - 8) / 8) return 0;
     while ((size_t)index >= actionsCache.size()) {
         u32 i = (u32)actionsCache.size();
         ActionCacheEntry cacheEntry;
@@ -301,10 +335,9 @@ bool Native32Reader::getAction(u32 index, ActionEntry* out) {
         actionsCache.push_back(cacheEntry);
     }
     if (!actionsCache[index].valid) {
-        return false;
+        return 0;
     }
-    *out = actionsCache[index].entry;
-    return true;
+    return &actionsCache[index].entry;
 }
 
 bool Native32Reader::getActionCached(u32 index, ActionEntry* out) const {
@@ -443,12 +476,50 @@ bool Native32Reader::getImage(u32 index, RgbaImage* out) {
     return true;
 }
 
-const RgbaImage* Native32Reader::getImageRef(u32 index) {
+bool Native32Reader::getImageDimensions(u32 index, u32* imageWidth, u32* imageHeight) const {
+    if (!index || !imageWidth || !imageHeight) return false;
+    std::map<u32, ImageCacheEntry>::const_iterator cached = imagesCache.find(index);
+    if (cached != imagesCache.end()) {
+        *imageWidth = cached->second.image.width;
+        *imageHeight = cached->second.image.height;
+        return true;
+    }
+    size_t ptr, imgStart;
+    if (!fileRange(data.size(), (u64)base + imageIdx + 4ull * (index - 1), 4, &ptr)) return false;
+    u32 offset = read_u32_le(&data[0], ptr);
+    if (offset == 0xffffffffu || !fileRange(data.size(), (u64)base + offset, 8, &imgStart)) return false;
+    if (read_u32_le(&data[0], imgStart + 4) > data.size() - imgStart - 8) return false;
+    *imageWidth = read_u16_le(&data[0], imgStart);
+    *imageHeight = read_u16_le(&data[0], imgStart + 2);
+    return validRasterSize(*imageWidth, *imageHeight);
+}
+
+size_t Native32Reader::imageCacheBudgetBytes() const {
+    const size_t maxImages = 6u * 1024u * 1024u;
+    const size_t minImages = 1u * 1024u * 1024u;
+    const size_t sourceAndImages = 14u * 1024u * 1024u;
+    // Large SSL files remain resident alongside decoded images. A fixed 6 MiB
+    // cache leaves no room for music, the canvas and display buffers on a
+    // 32 MiB PSP (CMSTART failed allocating its first 471,674-byte MP3).
+    // Count allocated capacity, including spare space after asset expansion.
+    // Keep the existing working set for smaller scenes: CMPLAY (8.96 MiB)
+    // fits, but starts re-decoding its visible images below the 6 MiB cache.
+    if (data.capacity() <= 10u * 1024u * 1024u) return maxImages;
+    if (data.capacity() >= sourceAndImages - minImages) return minImages;
+    return std::min(maxImages, sourceAndImages - data.capacity());
+}
+
+const RgbaImage* Native32Reader::getImageRef(u32 index, bool* allPixelsVisible,
+                                           const ImageDrawInfo** drawInfo) {
+    if (allPixelsVisible) *allPixelsVisible = false;
+    if (drawInfo) *drawInfo = 0;
     if (index == 0) return 0;
-    std::map<u32, RgbaImage>::const_iterator cached = imagesCache.find(index);
+    std::map<u32, ImageCacheEntry>::const_iterator cached = imagesCache.find(index);
     if (cached != imagesCache.end()) {
         imageLastUsed[index] = ++imageClock;
-        return &cached->second;
+        if (allPixelsVisible) *allPixelsVisible = cached->second.drawInfo.allPixelsVisible;
+        if (drawInfo) *drawInfo = &cached->second.drawInfo;
+        return &cached->second.image;
     }
     std::map<u32, bool>::const_iterator known = imageValidCache.find(index);
     if (known != imageValidCache.end()) {
@@ -479,32 +550,47 @@ const RgbaImage* Native32Reader::getImageRef(u32 index) {
         imageValidCache[index] = false;
         return 0;
     }
-    size_t imgEnd = imgStart + 8 + imgSize;
     u32 width = read_u16_le(&data[0], imgStart);
     u32 height = read_u16_le(&data[0], imgStart + 2);
     if (!validRasterSize(width, height)) { imageValidCache[index] = false; return 0; }
     const size_t bytes = (size_t)width * height * sizeof(u32);
-    const size_t budget = 6u * 1024u * 1024u;
+    const size_t budget = imageCacheBudgetBytes();
     // Evict before decoding so old and new image sets never coexist above the
-    // payload budget. Entry count also bounds map overhead for tiny sprites.
+    // payload budget. A single image larger than the budget can still be drawn
+    // after every other entry is evicted. Entry count bounds tiny-sprite maps.
     while (!imagesCache.empty() && (cachedImageBytes + bytes > budget || imagesCache.size() >= 512)) {
         std::map<u32, u64>::iterator oldest = imageLastUsed.begin();
         for (std::map<u32, u64>::iterator it = imageLastUsed.begin(); it != imageLastUsed.end(); ++it)
             if (it->second < oldest->second) oldest = it;
         u32 victim = oldest->first;
-        cachedImageBytes -= imagesCache.find(victim)->second.pixels.size() * sizeof(u32);
+        cachedImageBytes -= imagesCache.find(victim)->second.image.pixels.size() * sizeof(u32);
         imagesCache.erase(victim);
         imageLastUsed.erase(oldest);
         ++imageEvictions;
     }
-    std::vector<u8> imageData(data.begin() + imgStart, data.begin() + imgEnd);
     RgbaImage image;
-    bool ok = colorspace == ColorspaceArgb ? decodeImageArgb(imageData, &image) : decodeImageYuv(imageData, &image);
+    ImageDrawInfo decodedInfo;
+    const u8* imageData = data.data() + imgStart;
+#ifdef PSP
+    const u32 decodeBegin = sceKernelGetSystemTimeLow();
+#endif
+    bool ok = colorspace == ColorspaceArgb ? decodeImageArgb(imageData, imgSize + 8, &image, &decodedInfo) :
+                                             decodeImageYuv(imageData, imgSize + 8, &image, &decodedInfo);
+    ++decodedImages;
+#ifdef PSP
+    const u32 elapsed = sceKernelGetSystemTimeLow() - decodeBegin;
+    decodeMicros += elapsed;
+    decodePeakMicros = std::max(decodePeakMicros, elapsed);
+#endif
     if (ok) {
-        imagesCache[index] = std::move(image);
+        ImageCacheEntry& entry = imagesCache[index];
+        entry.drawInfo = decodedInfo;
+        entry.image = std::move(image);
         cachedImageBytes += bytes;
         imageLastUsed[index] = ++imageClock;
-        return &imagesCache.find(index)->second;
+        if (allPixelsVisible) *allPixelsVisible = entry.drawInfo.allPixelsVisible;
+        if (drawInfo) *drawInfo = &entry.drawInfo;
+        return &entry.image;
     }
     imageValidCache[index] = false;
     return 0;

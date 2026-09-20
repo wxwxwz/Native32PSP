@@ -24,6 +24,19 @@ struct VlcUintEntry {
     VlcUintEntry(int nextValue, int valueValue) : next((short)nextValue), value(valueValue & 0xffff) {}
 };
 
+// A bounded first-byte lookup for an immutable VLC tree. Long codes continue
+// at the stored tree node; entries retain the exact number of consumed bits.
+struct VlcUintPrefix {
+    struct Entry {
+        short next;
+        unsigned short value;
+        unsigned char bits;
+    };
+    const VlcUintEntry* table;
+    Entry entries[256];
+    explicit VlcUintPrefix(const VlcUintEntry* tree);
+};
+
 // MSB-first bit reader for MPEG streams. Faithful port of the Java MpegBuffer
 // reference implementation.
 class ByteSource {
@@ -52,6 +65,7 @@ public:
     std::vector<u8> peekBytes(size_t size) const;
     short readVlc(const VlcEntry* table);
     int readVlcUint(const VlcUintEntry* table);
+    int readVlcUint(const VlcUintPrefix& prefix);
     bool peekNonZero(size_t bitCount);
     void discardReadBytes();
     bool findFrameSync();
@@ -61,6 +75,9 @@ public:
     mutable bool sourceEnded=false;
     static const size_t streamLimit=512*1024;
     size_t bitIndex;
+
+private:
+    int readVlcUintAt(const VlcUintEntry* table, short index);
 };
 
 }

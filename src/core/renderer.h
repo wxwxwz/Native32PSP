@@ -36,17 +36,21 @@ private:
         DrawSourceType sourceType;
         u32 imageIndex;
         const RgbaImage* overrideImage;
-        s32 x;
-        s32 y;
+        const ImageDrawInfo* overrideInfo;
+        s64 x;
+        s64 y;
         u32 depth;
         size_t order;
     };
 
     struct SpriteOverride {
         RgbaImage image;
+        ImageDrawInfo drawInfo;
         bool hasVisibilityLeader;
         std::string visibilityLeader;
     };
+
+    void blitImage(const RgbaImage& image, s32 dstX, s32 dstY, const ImageDrawInfo& info);
 
     std::map<std::string, SpriteOverride> spriteOverrides;
     // Reused across frames to avoid allocating the draw list at 30 Hz.

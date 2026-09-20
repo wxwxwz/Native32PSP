@@ -34,7 +34,7 @@ struct Settings {
     VideoScaling scaling;
     FrameSkip frameSkip;
     u32 volume;          // 0..100
-    bool smoothing;      // Bilinear filter when scaling
+    bool smoothing;      // Scaling filter: false = Sharp (nearest), true = Smooth (linear)
     bool showFps;
     int theme=0;
     bool lightAppearance=false;

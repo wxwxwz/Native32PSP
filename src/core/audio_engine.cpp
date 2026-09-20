@@ -5,6 +5,9 @@
 #include <cmath>
 #include <cstring>
 #include <utility>
+#if defined(PSP) || defined(N32_TEST_CORE_PROFILE)
+#include <pspkernel.h>
+#endif
 #if defined(PSP) || defined(N32_TEST_PSP_MP3)
 #include "platform/psp_log.h"
 #include <stdint.h>
@@ -15,6 +18,38 @@
 #endif
 
 namespace n32 {
+
+static u32 soundProfileClock() {
+#if defined(PSP) || defined(N32_TEST_CORE_PROFILE)
+    return sceKernelGetSystemTimeLow();
+#else
+    return 0;
+#endif
+}
+
+struct SoundProfileScope {
+    SoundTickProfile& profile;
+    u32 begin, bytes;
+    u16 soundValue;
+    s32 format;
+
+    SoundProfileScope(SoundTickProfile& value, u16 sound)
+        : profile(value), begin(soundProfileClock()), bytes(0),
+          soundValue(sound), format(-1) {
+        ++profile.calls;
+    }
+
+    ~SoundProfileScope() {
+        const u32 elapsed = soundProfileClock() - begin;
+        profile.totalMicros += elapsed;
+        if (profile.calls == 1 || elapsed > profile.maxMicros) {
+            profile.maxMicros = elapsed;
+            profile.slowBytes = bytes;
+            profile.slowSoundValue = soundValue;
+            profile.slowFormat = format;
+        }
+    }
+};
 
 static const size_t MAX_SOUND_EFFECTS = 8;
 
@@ -36,6 +71,10 @@ AudioEngine::AudioEngine()
 AudioEngine::AudioEngine(Colorspace colorspaceValue, u32 volumeValue)
     : volume((float)volumeValue / 100.0f), colorspace(colorspaceValue), nextChannelId(1),
       sampleFrameRemainder(0), tonePhase(0.0), toneActive(false) {
+}
+
+void AudioEngine::resetProfile() {
+    profile = SoundTickProfile();
 }
 
 u32 AudioEngine::outputSampleRate() const {
@@ -185,6 +224,7 @@ size_t AudioEngine::addChannel(std::vector<s16> samples, u8 repeat, const std::s
 }
 
 size_t AudioEngine::playSound(Native32Reader* reader, u16 soundValue, const std::string& movieName) {
+    SoundProfileScope profileScope(profile, soundValue);
     if (!reader) {
         return 0;
     }
@@ -197,6 +237,8 @@ size_t AudioEngine::playSound(Native32Reader* reader, u16 soundValue, const std:
     if (!reader->getSound(index, &sound)) {
         return 0;
     }
+    profileScope.format = (s32)sound.format;
+    profileScope.bytes = (u32)sound.data.size();
     return sound.format == AudioMp3 ? playMp3(sound.data, repeat, movieName) : playRaw(sound.data, repeat, movieName);
 }
 
@@ -430,7 +472,9 @@ void resampleToStereo(const std::vector<float>& samples,size_t channels,u32 inpu
     u64 phase = 0;
     for (size_t frame = 0; frame < outputFrames; ++frame) {
         size_t nextFrame = std::min(sourceFrame + 1, inputFrames - 1);
-        float fraction = (float)phase / (float)outputRate;
+        // The entry phase is below outputRate, so it fits u32 even when the
+        // subsequent addition needs u64. Avoid PSP's per-frame __floatundisf.
+        float fraction = (float)(u32)phase / (float)outputRate;
         for (size_t ch = 0; ch < 2; ++ch) {
             size_t sourceChannel = std::min(ch, channels - 1);
             float first = samples[std::min(sourceFrame, inputFrames - 1) * channels + sourceChannel];

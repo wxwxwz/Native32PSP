@@ -184,26 +184,32 @@ public:
     Demux demux;Packet packet;size_t offset;int type;
     PacketSource(std::shared_ptr<ByteSource> file,int stream):demux(Buffer(file),false),offset(0),type(stream){}
     size_t read(u8* out,size_t capacity) {
-        size_t written=0;
-        while(written<capacity) {
-            while(offset==packet.payloadSize) {
-                if(!demux.decode(&packet))return written;
-                offset=0;
-                if(packet.type!=type){offset=packet.payloadSize;continue;}
-                if(!packet.payloadSize)continue;
-                break;
-            }
-            size_t n=std::min(capacity-written,packet.payloadSize-offset);
-            memcpy(out+written,packet.payload+offset,n);offset+=n;written+=n;
+        if(!capacity)return 0;
+        while(offset==packet.payloadSize) {
+            if(!demux.decode(&packet))return 0;
+            offset=0;
+            if(packet.type!=type){offset=packet.payloadSize;continue;}
+            if(!packet.payloadSize)continue;
+            break;
         }
-        return written;
+        // Return available payload promptly. Filling a 16 KiB ES request used
+        // to scan many interleaved packets, especially for low-bitrate audio,
+        // even when the decoder needed only its next frame. Buffer::has will
+        // ask again if this packet is insufficient; no playback data is lost.
+        size_t n=std::min(capacity,packet.payloadSize-offset);
+        memcpy(out,packet.payload+offset,n);offset+=n;
+        return n;
     }
 };
 }
 std::shared_ptr<ByteSource> openProgramStream(const std::string& path,int type) {
     std::shared_ptr<FileSource> file(new FileSource(path));
     if(!file->file)return std::shared_ptr<ByteSource>();
-    std::shared_ptr<PacketSource> stream(new PacketSource(file,type));
+    return openProgramStream(file,type);
+}
+std::shared_ptr<ByteSource> openProgramStream(std::shared_ptr<ByteSource> input,int type) {
+    if(!input)return std::shared_ptr<ByteSource>();
+    std::shared_ptr<PacketSource> stream(new PacketSource(input,type));
     if(!stream->demux.hasHeaders())return std::shared_ptr<ByteSource>();
     // Legacy discs may declare audio_bound=0 despite containing C0 packets.
     // Header counts are advisory; let packet discovery determine actual audio.

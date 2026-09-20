@@ -7,7 +7,9 @@
 namespace n32 {
 void PspApp::takeScreenshot() {
     std::string path;
-    bool ok=saveScreenshot(screenshotDirectory(),pspFrame,pspFrameWidth,pspFrameHeight,&path);
+    std::vector<u32> pixels;
+    bool ok=captureGameFrame(&pixels) && saveScreenshot(screenshotDirectory(),pixels,
+        gamePresentation.width(),gamePresentation.height(),&path);
     screenshotNotice=ok?tr("Screenshot saved"):tr("Screenshot failed: check free space");
     screenshotNoticeTicks=60; pauseStatus=screenshotNotice;
     pspLog("screenshot: %s %s",ok?"saved":"failed",path.c_str());

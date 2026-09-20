@@ -1,11 +1,27 @@
 #include "core/mpeg/buffer.h"
 #include <algorithm>
+#include <cstring>
 #include <utility>
 
 namespace n32 {
 namespace mpeg {
 
 const size_t Buffer::streamLimit;
+
+VlcUintPrefix::VlcUintPrefix(const VlcUintEntry* tree) : table(tree) {
+    for (unsigned key = 0; key < 256; ++key) {
+        short index = 0;
+        for (unsigned bits = 1; bits <= 8; ++bits) {
+            const VlcUintEntry& node = tree[index + ((key >> (8 - bits)) & 1)];
+            Entry& entry = entries[key];
+            entry.next = node.next;
+            entry.value = (unsigned short)node.value;
+            entry.bits = (unsigned char)bits;
+            if (node.next <= 0) break;
+            index = node.next;
+        }
+    }
+}
 
 Buffer::Buffer() : bitIndex(0) {
 }
@@ -101,13 +117,24 @@ size_t Buffer::skipBytes(u8 value) {
 s32 Buffer::nextStartCode() {
     align();
     while (has(5 << 3)) {
-        size_t byteIndex = bitIndex >> 3;
-        if (byteIndex + 3 < data.size() &&
-            data[byteIndex] == 0x00 && data[byteIndex + 1] == 0x00 && data[byteIndex + 2] == 0x01) {
-            bitIndex = (byteIndex + 4) << 3;
-            return data[byteIndex + 3] & 0xff;
+        // Search buffered bytes as a span instead of calling has() for every
+        // byte of each picture (including lookahead and dropped B pictures).
+        // Keep the original five-byte lookahead and refill/EOF cursor exactly.
+        size_t end = data.size() - 4;
+        if (source && !sourceEnded) end = std::min(end, streamLimit - 4);
+        const u8* const begin = data.data();
+        const u8* cursor = begin + (bitIndex >> 3);
+        const u8* const stop = begin + end;
+        while (cursor < stop) {
+            cursor = static_cast<const u8*>(std::memchr(cursor, 0, (size_t)(stop - cursor)));
+            if (!cursor) break;
+            if (cursor[1] == 0 && cursor[2] == 1) {
+                bitIndex = ((size_t)(cursor - begin) + 4) << 3;
+                return cursor[3];
+            }
+            ++cursor;
         }
-        bitIndex += 8;
+        bitIndex = end << 3;
     }
     return -1;
 }
@@ -165,7 +192,27 @@ short Buffer::readVlc(const VlcEntry* table) {
 }
 
 int Buffer::readVlcUint(const VlcUintEntry* table) {
-    short index = 0;
+    return readVlcUintAt(table, 0);
+}
+
+int Buffer::readVlcUint(const VlcUintPrefix& prefix) {
+    // Do not request extra bytes just for a lookup: short codes at a stream
+    // boundary retain the original refill, EOF and stream-limit behaviour.
+    const size_t bits = lenBits();
+    if (bitIndex <= bits && bits - bitIndex >= 8) {
+        const size_t byte = bitIndex >> 3;
+        const unsigned offset = bitIndex & 7;
+        unsigned key = data[byte];
+        if (offset) key = ((key << 8) | data[byte + 1]) >> (8 - offset);
+        const VlcUintPrefix::Entry& entry = prefix.entries[key & 255];
+        bitIndex += entry.bits;
+        if (entry.next <= 0) return entry.value;
+        return readVlcUintAt(prefix.table, entry.next);
+    }
+    return readVlcUintAt(prefix.table, 0);
+}
+
+int Buffer::readVlcUintAt(const VlcUintEntry* table, short index) {
     for (;;) {
         short bit = 0;
         if ((bitIndex >> 3) < data.size() || has(1)) {

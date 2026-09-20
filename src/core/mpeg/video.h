@@ -42,6 +42,23 @@ struct Motion {
     Motion() : fullPx(false), isSet(false), rSize(0), h(0), v(0) {}
 };
 
+// Optional per-caller diagnostics. Picture attempts count decodePicture calls,
+// not display frames or verified successful reconstructions. Index 0 is an
+// invalid/other type; 1, 2 and 3 are I, P and B. Timings are PSP-only and exclude
+// outer start-code searches/demux reads; skipped B scanning has its own timer.
+struct DecodeDiagnostics {
+    unsigned pictureAttempts[4];
+    unsigned pictureMicros[4];
+    unsigned pictureMaxMicros[4];
+    unsigned skippedB;
+    unsigned skipMicros;
+    unsigned skipMaxMicros;
+
+    DecodeDiagnostics()
+        : pictureAttempts(), pictureMicros(), pictureMaxMicros(),
+          skippedB(0), skipMicros(0), skipMaxMicros(0) {}
+};
+
 // MPEG-1 video decoder. Faithful port of the Java MpegVideo reference.
 class Video {
 public:
@@ -62,7 +79,9 @@ public:
     // (in which case the caller should treat the video as finished).
     // With skipB, non-reference B pictures advance time without reconstruction;
     // skipped must be supplied and frameIndex is invalid when *skipped is true.
-    bool decode(size_t* frameIndex, bool skipB = false, bool* skipped = 0);
+    // If supplied, diagnostics are accumulated, not reset, by this call.
+    bool decode(size_t* frameIndex, bool skipB = false, bool* skipped = 0,
+                DecodeDiagnostics* diagnostics = 0);
 
 private:
     Buffer buffer;

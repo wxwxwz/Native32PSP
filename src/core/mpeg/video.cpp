@@ -3,6 +3,10 @@
 #include <algorithm>
 #include <utility>
 #include <cmath>
+#include <cstring>
+#ifdef PSP
+#include <pspkernel.h>
+#endif
 
 namespace n32 {
 namespace mpeg {
@@ -185,6 +189,89 @@ static const VlcUintEntry DCT_COEFF[] = {
     VlcUintEntry(0, 0x1d01), VlcUintEntry(0, 0x1c01), VlcUintEntry(0, 0x1b01),
 };
 
+static const VlcUintPrefix DCT_COEFF_PREFIX(DCT_COEFF);
+
+// Most coefficients, their sign and the end-of-block marker fit in one byte.
+// Keep separate tables for the first non-intra coefficient, where a leading
+// one is a coefficient rather than the start of the two-bit EOB marker.
+struct DctCoefficientPrefix {
+    struct Entry {
+        short level;
+        unsigned char run;
+        unsigned char bits;
+    };
+    Entry entries[2][256];
+    DctCoefficientPrefix() : entries() {
+        for (unsigned haveCoefficient = 0; haveCoefficient < 2; ++haveCoefficient) {
+            for (unsigned key = 0; key < 256; ++key) {
+                const VlcUintPrefix::Entry& code = DCT_COEFF_PREFIX.entries[key];
+                if (code.next > 0 || code.value == 0xffff) continue;
+                unsigned bits = code.bits;
+                Entry& result = entries[haveCoefficient][key];
+                if (code.value == 1 && haveCoefficient) {
+                    if (bits == 8) continue;
+                    const unsigned more = (key >> (7 - bits)) & 1;
+                    ++bits;
+                    if (!more) {
+                        result.run = 255;
+                        result.bits = (unsigned char)bits;
+                        continue;
+                    }
+                }
+                if (bits == 8) continue;
+                const bool negative = ((key >> (7 - bits)) & 1) != 0;
+                const int level = code.value & 255;
+                result.level = (short)(negative ? -level : level);
+                result.run = (unsigned char)(code.value >> 8);
+                result.bits = (unsigned char)(bits + 1);
+            }
+        }
+    }
+};
+
+static const DctCoefficientPrefix DCT_COEFFICIENT_PREFIX;
+
+static inline bool readDctCoefficient(Buffer& buffer, bool haveCoefficient,
+                                      int* run, int* level) {
+    // Never refill for the lookup. A short tail, escape or long code follows
+    // the original reader, including its exact EOF and refill behaviour.
+    const size_t bits = buffer.data.size() << 3;
+    if (buffer.bitIndex <= bits && bits - buffer.bitIndex >= 8) {
+        const size_t byte = buffer.bitIndex >> 3;
+        const unsigned offset = buffer.bitIndex & 7;
+        unsigned key = buffer.data[byte];
+        if (offset) key = ((key << 8) | buffer.data[byte + 1]) >> (8 - offset);
+        const DctCoefficientPrefix::Entry& entry =
+            DCT_COEFFICIENT_PREFIX.entries[haveCoefficient ? 1 : 0][key & 255];
+        if (entry.bits) {
+            buffer.bitIndex += entry.bits;
+            if (entry.run == 255) return false;
+            *run = entry.run;
+            *level = entry.level;
+            return true;
+        }
+    }
+
+    const int coeff = buffer.readVlcUint(DCT_COEFF_PREFIX);
+    if (coeff == 0x0001 && haveCoefficient && buffer.read(1) == 0) return false;
+    if (coeff == 0xffff) {
+        *run = (int)buffer.read(6);
+        *level = (int)buffer.read(8);
+        if (*level == 0) {
+            *level = (int)buffer.read(8);
+        } else if (*level == 128) {
+            *level = (int)buffer.read(8) - 256;
+        } else if (*level > 128) {
+            *level -= 256;
+        }
+    } else {
+        *run = coeff >> 8;
+        *level = coeff & 0xff;
+        if (buffer.read(1) != 0) *level = -*level;
+    }
+    return true;
+}
+
 static const VlcEntry* macroblockTypeTable(int pictureType) {
     if (pictureType == PICTURE_TYPE_INTRA) {
         return MACROBLOCK_TYPE_INTRA;
@@ -263,7 +350,8 @@ bool Video::hasHeader() {
     return hasSequenceHeader;
 }
 
-bool Video::decode(size_t* frameIndex, bool skipB, bool* skipped) {
+bool Video::decode(size_t* frameIndex, bool skipB, bool* skipped,
+                   DecodeDiagnostics* diagnostics) {
     buffer.discardReadBytes();
     if (skipped) *skipped = false;
     if (!hasHeader()) {
@@ -293,6 +381,9 @@ bool Video::decode(size_t* frameIndex, bool skipB, bool* skipped) {
             const int type = (int)buffer.read(3);
             buffer.bitIndex = saved;
             if (type == PICTURE_TYPE_B) {
+#ifdef PSP
+                const unsigned skipBegin = diagnostics ? sceKernelGetSystemTimeLow() : 0;
+#endif
                 // B pictures never become prediction references. Leave all
                 // frame buffers/rotation untouched and consume one display slot.
                 pictureType = type;
@@ -301,10 +392,31 @@ bool Video::decode(size_t* frameIndex, bool skipB, bool* skipped) {
                 ++framesDecoded;
                 time = (double)framesDecoded / mFramerate;
                 *skipped = true;
+                if (diagnostics) {
+                    ++diagnostics->skippedB;
+#ifdef PSP
+                    const unsigned micros = sceKernelGetSystemTimeLow() - skipBegin;
+                    diagnostics->skipMicros += micros;
+                    diagnostics->skipMaxMicros = std::max(diagnostics->skipMaxMicros, micros);
+#endif
+                }
                 return true;
             }
         }
+#ifdef PSP
+        const unsigned pictureBegin = diagnostics ? sceKernelGetSystemTimeLow() : 0;
+#endif
         decodePicture();
+        if (diagnostics) {
+            const unsigned type = pictureType >= PICTURE_TYPE_INTRA && pictureType <= PICTURE_TYPE_B
+                                ? (unsigned)pictureType : 0;
+            ++diagnostics->pictureAttempts[type];
+#ifdef PSP
+            const unsigned micros = sceKernelGetSystemTimeLow() - pictureBegin;
+            diagnostics->pictureMicros[type] += micros;
+            diagnostics->pictureMaxMicros[type] = std::max(diagnostics->pictureMaxMicros[type], micros);
+#endif
+        }
         size_t frame = 0;
         bool hasFrame = false;
         if (assumeNoBFrames) {
@@ -670,30 +782,9 @@ void Video::decodeBlock(int block) {
 
     const int* quantMatrix = intra ? intraQuantMatrix : nonIntraQuantMatrix;
     for (;;) {
-        int coeff = buffer.readVlcUint(DCT_COEFF);
-        if (coeff == 0x0001 && n > 0 && buffer.read(1) == 0) {
-            break;
-        }
-
         int run;
         int level;
-        if (coeff == 0xffff) {
-            run = (int)buffer.read(6);
-            level = (int)buffer.read(8);
-            if (level == 0) {
-                level = (int)buffer.read(8);
-            } else if (level == 128) {
-                level = (int)buffer.read(8) - 256;
-            } else if (level > 128) {
-                level -= 256;
-            }
-        } else {
-            run = coeff >> 8;
-            level = coeff & 0xff;
-            if (buffer.read(1) != 0) {
-                level = -level;
-            }
-        }
+        if (!readDctCoefficient(buffer, n > 0, &run, &level)) break;
 
         n += run;
         if (n >= 64) {
@@ -715,16 +806,11 @@ void Video::decodeBlock(int block) {
         blockData[deZigZagged] = level * PREMULTIPLIER_MATRIX[deZigZagged];
     }
 
-    // Take the coefficients and clear the accumulator for the next block;
-    // leaving stale values here corrupts every following block.
-    int s[64];
-    for (int i = 0; i < 64; ++i) {
-        s[i] = blockData[i];
-        blockData[i] = 0;
-    }
+    // Transform in place; no second 64-coefficient array is needed. Clear all
+    // entries after output, including stale AC values from an invalid block.
     bool nIsOne = n == 1;
     if (!nIsOne) {
-        idct(s);
+        idct(blockData);
     }
 
     int dw;
@@ -744,6 +830,7 @@ void Video::decodeBlock(int block) {
     }
 
     if ((size_t)cur >= frames.size()) {
+        std::memset(blockData, 0, sizeof(blockData));
         return;
     }
     Frame* frame = &frames[(size_t)cur];
@@ -758,15 +845,16 @@ void Video::decodeBlock(int block) {
 
     if (intra) {
         if (nIsOne) {
-            blockSetConst(*d, di, dw, clampU8((s[0] + 128) >> 8));
+            blockSetConst(*d, di, dw, clampU8((blockData[0] + 128) >> 8));
         } else {
-            blockSetOverwrite(*d, di, dw, s);
+            blockSetOverwrite(*d, di, dw, blockData);
         }
     } else if (nIsOne) {
-        blockSetAddConst(*d, di, dw, (s[0] + 128) >> 8);
+        blockSetAddConst(*d, di, dw, (blockData[0] + 128) >> 8);
     } else {
-        blockSetAdd(*d, di, dw, s);
+        blockSetAdd(*d, di, dw, blockData);
     }
+    std::memset(blockData, 0, sizeof(blockData));
 }
 
 // Preserve the exact integer conversion, including green's single rounding
@@ -795,6 +883,68 @@ static inline u32 rgbFromLuma(u8 luma, int r, int g, int b) {
         ((u32)yuv.clamp[yy - g + 320] << 8) | (u32)yuv.clamp[yy + b + 320];
 }
 
+static const size_t RGB_MAPPED_COLUMNS = 512;
+
+// Keep the bounded 1 KiB column map off the unscaled/fallback call paths.
+// Only the output vector may allocate, before this helper is entered.
+static __attribute__((noinline)) void writeRgbMapped(const Frame& frame,
+                                                     std::vector<u32>* dst,
+                                                     size_t dstW, size_t dstH) {
+    u16 sourceX[RGB_MAPPED_COLUMNS];
+    const size_t xStep = frame.width / dstW;
+    const size_t xRemainder = frame.width % dstW;
+    size_t sx = 0, xError = 0;
+    for (size_t tx = 0; tx < dstW; ++tx) {
+        sourceX[tx] = (u16)sx;
+        sx += xStep;
+        xError += xRemainder;
+        if (xError >= dstW) {
+            xError -= dstW;
+            ++sx;
+        }
+    }
+
+    for (size_t ty = 0; ty < dstH;) {
+        size_t sy0 = ty * frame.height / dstH;
+        if (sy0 >= frame.height) sy0 = frame.height - 1;
+        size_t sy1 = sy0;
+        if (ty + 1 < dstH) {
+            sy1 = (ty + 1) * frame.height / dstH;
+            if (sy1 >= frame.height) sy1 = frame.height - 1;
+        }
+        const u8* yRow0 = frame.y.data.data() + sy0 * frame.y.width;
+        const u8* crRow = frame.cr.data.data() + (sy0 >> 1) * frame.cr.width;
+        const u8* cbRow = frame.cb.data.data() + (sy0 >> 1) * frame.cb.width;
+        u32* out0 = dst->data() + ty * dstW;
+        if (ty + 1 < dstH && (sy0 >> 1) == (sy1 >> 1)) {
+            const u8* yRow1 = frame.y.data.data() + sy1 * frame.y.width;
+            u32* out1 = out0 + dstW;
+            for (size_t tx = 0; tx < dstW; ++tx) {
+                const size_t x = sourceX[tx];
+                const int crValue = crRow[x >> 1];
+                const int cbValue = cbRow[x >> 1];
+                const int r = yuv.r[crValue];
+                const int g = (yuv.gc[cbValue] + yuv.gr[crValue]) >> 16;
+                const int b = yuv.b[cbValue];
+                out0[tx] = rgbFromLuma(yRow0[x], r, g, b);
+                out1[tx] = rgbFromLuma(yRow1[x], r, g, b);
+            }
+            ty += 2;
+        } else {
+            for (size_t tx = 0; tx < dstW; ++tx) {
+                const size_t x = sourceX[tx];
+                const int crValue = crRow[x >> 1];
+                const int cbValue = cbRow[x >> 1];
+                const int r = yuv.r[crValue];
+                const int g = (yuv.gc[cbValue] + yuv.gr[crValue]) >> 16;
+                const int b = yuv.b[cbValue];
+                out0[tx] = rgbFromLuma(yRow0[x], r, g, b);
+            }
+            ++ty;
+        }
+    }
+}
+
 void Frame::writeRgbScaled(std::vector<u32>* dst, size_t dstW, size_t dstH) const {
     if (!dst || width == 0 || height == 0 || dstW == 0 || dstH == 0) {
         return;
@@ -814,35 +964,87 @@ void Frame::writeRgbScaled(std::vector<u32>* dst, size_t dstW, size_t dstH) cons
         return;
     }
 
-    // Native32 cutscenes are normally rendered at their decoded size. Avoid
-    // the per-pixel multiply/divide used by the general scaler in that case;
-    // this is a sizeable win on the PSP's software MPEG path.
+    // Unscaled frames share chroma directly across each 2x2 luma block.
     if (dstW == sourceWidth && dstH == sourceHeight) {
-        // A 2x2 luma block shares one chroma sample in MPEG 4:2:0. Compute
-        // its colour contribution once, preserving the integer rounding.
-        for (size_t sy = 0; sy < sourceHeight; sy += 2) {
-            const u8* yRow = &y.data[sy * y.width];
-            const u8* crRow = &cr.data[(sy >> 1) * cr.width];
-            const u8* cbRow = &cb.data[(sy >> 1) * cb.width];
-            u32* out = &(*dst)[sy * dstW];
-            const bool secondRow = sy + 1 < sourceHeight;
-            for (size_t sx = 0; sx < sourceWidth; sx += 2) {
-                int crValue = crRow[sx >> 1];
-                int cbValue = cbRow[sx >> 1];
+        const size_t yPitch = y.width, crPitch = cr.width, cbPitch = cb.width;
+        const size_t rowPairs = sourceHeight / 2, columnPairs = sourceWidth / 2;
+        const bool oddWidth = (sourceWidth & 1) != 0;
+        const u8* yRows = y.data.data();
+        const u8* crRow = cr.data.data();
+        const u8* cbRow = cb.data.data();
+        u32* outRows = dst->data();
 
-                int r = yuv.r[crValue];
-                int g = (yuv.gc[cbValue] + yuv.gr[crValue]) >> 16;
-                int b = yuv.b[cbValue];
+        // Full 2x2 blocks have no edge tests in their inner loop. Snapshot the
+        // independent pitches once, and advance pointers through both rows.
+        for (size_t row = 0; row < rowPairs; ++row) {
+            const u8* y0 = yRows;
+            const u8* y1 = yRows + yPitch;
+            const u8* crPixel = crRow;
+            const u8* cbPixel = cbRow;
+            u32* out0 = outRows;
+            u32* out1 = outRows + sourceWidth;
+            for (size_t column = 0; column < columnPairs; ++column) {
+                const int crValue = *crPixel++;
+                const int cbValue = *cbPixel++;
+                const int r = yuv.r[crValue];
+                const int g = (yuv.gc[cbValue] + yuv.gr[crValue]) >> 16;
+                const int b = yuv.b[cbValue];
+                out0[0] = rgbFromLuma(y0[0], r, g, b);
+                out0[1] = rgbFromLuma(y0[1], r, g, b);
+                out1[0] = rgbFromLuma(y1[0], r, g, b);
+                out1[1] = rgbFromLuma(y1[1], r, g, b);
+                y0 += 2; y1 += 2;
+                out0 += 2; out1 += 2;
+            }
+            if (oddWidth) {
+                const int crValue = *crPixel;
+                const int cbValue = *cbPixel;
+                const int r = yuv.r[crValue];
+                const int g = (yuv.gc[cbValue] + yuv.gr[crValue]) >> 16;
+                const int b = yuv.b[cbValue];
+                *out0 = rgbFromLuma(*y0, r, g, b);
+                *out1 = rgbFromLuma(*y1, r, g, b);
+            }
+            yRows += yPitch * 2;
+            crRow += crPitch; cbRow += cbPitch;
+            outRows += sourceWidth * 2;
+        }
 
-                out[sx] = rgbFromLuma(yRow[sx], r, g, b);
-                if (sx + 1 < sourceWidth) out[sx + 1] = rgbFromLuma(yRow[sx + 1], r, g, b);
-                if (secondRow) {
-                    out[dstW + sx] = rgbFromLuma(yRow[y.width + sx], r, g, b);
-                    if (sx + 1 < sourceWidth)
-                        out[dstW + sx + 1] = rgbFromLuma(yRow[y.width + sx + 1], r, g, b);
-                }
+        // A final odd row uses the same horizontal chroma sharing, without
+        // ever forming or reading a nonexistent second luma/output row.
+        if (sourceHeight & 1) {
+            const u8* y0 = yRows;
+            const u8* crPixel = crRow;
+            const u8* cbPixel = cbRow;
+            u32* out0 = outRows;
+            for (size_t column = 0; column < columnPairs; ++column) {
+                const int crValue = *crPixel++;
+                const int cbValue = *cbPixel++;
+                const int r = yuv.r[crValue];
+                const int g = (yuv.gc[cbValue] + yuv.gr[crValue]) >> 16;
+                const int b = yuv.b[cbValue];
+                out0[0] = rgbFromLuma(y0[0], r, g, b);
+                out0[1] = rgbFromLuma(y0[1], r, g, b);
+                y0 += 2; out0 += 2;
+            }
+            if (oddWidth) {
+                const int crValue = *crPixel;
+                const int cbValue = *cbPixel;
+                const int r = yuv.r[crValue];
+                const int g = (yuv.gc[cbValue] + yuv.gr[crValue]) >> 16;
+                const int b = yuv.b[cbValue];
+                *out0 = rgbFromLuma(*y0, r, g, b);
             }
         }
+        return;
+    }
+
+    // Build exact floor(tx * sourceWidth / dstW) positions once, then share
+    // chroma between adjacent output rows whenever they sample one chroma row.
+    // At least 2x vertical downscaling cannot share rows, so keep the original
+    // path there. Division avoids overflow in the sourceHeight < 2*dstH test.
+    if (dstW <= RGB_MAPPED_COLUMNS && sourceWidth <= 65536 && sourceHeight / dstH < 2) {
+        writeRgbMapped(*this, dst, dstW, dstH);
         return;
     }
 
@@ -884,50 +1086,77 @@ void Frame::writeRgbScaled(std::vector<u32>* dst, size_t dstW, size_t dstH) cons
 }
 
 static void blockSetConst(std::vector<u8>& d, int di, int dw, int value) {
-    int destScan = dw - 8;
+    u8* dst = &d[(size_t)di];
     for (int y = 0; y < 8; ++y) {
-        for (int x = 0; x < 8; ++x) {
-            d[(size_t)di] = (u8)value;
-            ++di;
-        }
-        di += destScan;
+        std::memset(dst + y * dw, value, 8);
     }
 }
 
 static void blockSetOverwrite(std::vector<u8>& d, int di, int dw, const int s[64]) {
-    int destScan = dw - 8;
-    int si = 0;
+    u8* dst = &d[(size_t)di];
     for (int y = 0; y < 8; ++y) {
+        u8* row = dst + y * dw;
         for (int x = 0; x < 8; ++x) {
-            d[(size_t)di] = (u8)clampU8(s[si]);
-            ++si;
-            ++di;
+            row[x] = (u8)clampU8(s[y * 8 + x]);
         }
-        di += destScan;
     }
 }
 
 static void blockSetAddConst(std::vector<u8>& d, int di, int dw, int value) {
-    int destScan = dw - 8;
+    u8* dst = &d[(size_t)di];
     for (int y = 0; y < 8; ++y) {
+        u8* row = dst + y * dw;
         for (int x = 0; x < 8; ++x) {
-            d[(size_t)di] = (u8)clampU8((int)d[(size_t)di] + value);
-            ++di;
+            row[x] = (u8)clampU8((int)row[x] + value);
         }
-        di += destScan;
     }
 }
 
 static void blockSetAdd(std::vector<u8>& d, int di, int dw, const int s[64]) {
-    int destScan = dw - 8;
-    int si = 0;
+    u8* dst = &d[(size_t)di];
     for (int y = 0; y < 8; ++y) {
+        u8* row = dst + y * dw;
         for (int x = 0; x < 8; ++x) {
-            d[(size_t)di] = (u8)clampU8((int)d[(size_t)di] + s[si]);
-            ++si;
-            ++di;
+            row[x] = (u8)clampU8((int)row[x] + s[y * 8 + x]);
         }
-        di += destScan;
+    }
+}
+
+template<bool oddH, bool oddV, bool interpolate>
+static void processMacroblockRows(const u8* src, u8* dst, int stride, int blockSize) {
+    for (int y = 0; y < blockSize; ++y) {
+        const u8* source = src + y * stride;
+        u8* dest = dst + y * stride;
+        if (!oddH && !oddV && !interpolate) {
+            std::memcpy(dest, source, (size_t)blockSize);
+            continue;
+        }
+        for (int x = 0; x < blockSize; ++x) {
+            int value;
+            if (oddH && oddV) {
+                value = ((int)source[x] + source[x + 1] + source[x + stride] +
+                         source[x + stride + 1] + 2) >> 2;
+            } else if (oddH) {
+                value = ((int)source[x] + source[x + 1] + 1) >> 1;
+            } else if (oddV) {
+                value = ((int)source[x] + source[x + stride] + 1) >> 1;
+            } else {
+                value = source[x];
+            }
+            // B-frame averaging rounds the motion sample first, then the
+            // average with the destination. Combining these changes pixels.
+            if (interpolate) value = ((int)dest[x] + value + 1) >> 1;
+            dest[x] = (u8)value;
+        }
+    }
+}
+
+template<int blockSize>
+static void copyMacroblockRows(const u8* src, u8* dst, int stride) {
+    // A constant 8/16-byte length lets the PSP compiler inline each short copy.
+    // Motion can leave the source unaligned; memcpy preserves that contract.
+    for (int y = 0; y < blockSize; ++y) {
+        std::memcpy(dst + y * stride, src + y * stride, blockSize);
     }
 }
 
@@ -947,37 +1176,22 @@ static void processMacroblock(std::vector<u8>& s, std::vector<u8>& d, int mbRow,
         return;
     }
 
-    int si = (int)si0;
-    int di = (int)di0;
-    int scan = dw - blockSize;
-    for (int y = 0; y < blockSize; ++y) {
-        for (int x = 0; x < blockSize; ++x) {
-            int val;
-            if (!interpolate && !oddH && !oddV) {
-                val = (int)s[(size_t)si];
-            } else if (!interpolate && !oddH) {
-                val = ((int)s[(size_t)si] + (int)s[(size_t)(si + dw)] + 1) >> 1;
-            } else if (!interpolate && !oddV) {
-                val = ((int)s[(size_t)si] + (int)s[(size_t)(si + 1)] + 1) >> 1;
-            } else if (!interpolate) {
-                val = ((int)s[(size_t)si] + (int)s[(size_t)(si + 1)] + (int)s[(size_t)(si + dw)] +
-                       (int)s[(size_t)(si + dw + 1)] + 2) >> 2;
-            } else if (!oddH && !oddV) {
-                val = ((int)d[(size_t)di] + (int)s[(size_t)si] + 1) >> 1;
-            } else if (!oddH) {
-                val = ((int)d[(size_t)di] + (((int)s[(size_t)si] + (int)s[(size_t)(si + dw)] + 1) >> 1) + 1) >> 1;
-            } else if (!oddV) {
-                val = ((int)d[(size_t)di] + (((int)s[(size_t)si] + (int)s[(size_t)(si + 1)] + 1) >> 1) + 1) >> 1;
-            } else {
-                val = ((int)d[(size_t)di] + (((int)s[(size_t)si] + (int)s[(size_t)(si + 1)] +
-                       (int)s[(size_t)(si + dw)] + (int)s[(size_t)(si + dw + 1)] + 2) >> 2) + 1) >> 1;
-            }
-            d[(size_t)di] = (u8)val;
-            ++si;
-            ++di;
-        }
-        si += scan;
-        di += scan;
+    const u8* src = &s[(size_t)si0];
+    u8* dst = &d[(size_t)di0];
+    // Select the eight motion modes once for the block. Template constants
+    // remove direction and B-frame branches from the pixel loops.
+    if (interpolate) {
+        if (oddH && oddV) processMacroblockRows<true, true, true>(src, dst, dw, blockSize);
+        else if (oddH) processMacroblockRows<true, false, true>(src, dst, dw, blockSize);
+        else if (oddV) processMacroblockRows<false, true, true>(src, dst, dw, blockSize);
+        else processMacroblockRows<false, false, true>(src, dst, dw, blockSize);
+    } else {
+        if (oddH && oddV) processMacroblockRows<true, true, false>(src, dst, dw, blockSize);
+        else if (oddH) processMacroblockRows<true, false, false>(src, dst, dw, blockSize);
+        else if (oddV) processMacroblockRows<false, true, false>(src, dst, dw, blockSize);
+        else if (blockSize == 16) copyMacroblockRows<16>(src, dst, dw);
+        else if (blockSize == 8) copyMacroblockRows<8>(src, dst, dw);
+        else processMacroblockRows<false, false, false>(src, dst, dw, blockSize);
     }
 }
 

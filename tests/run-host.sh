@@ -1,5 +1,5 @@
 #!/bin/sh
-# Run from psp/native32psp. Optional arg: baseline directory with src/core files.
+# Run from psp/native32psp. Optional arg: complete baseline source directory.
 set -eu
 variant=${1:-.}
 mkdir -p tests/out
@@ -15,8 +15,9 @@ fi
 g++ -std=c++11 $flags $features -Wall -Wextra -Wno-mismatched-new-delete \
     -Itests/host -I"$variant/src" -Isrc tests/performance.cpp \
     "$variant/src/core/renderer.cpp" "$variant/src/core/audio_engine.cpp" \
-    "$variant/src/core/mpeg/video.cpp" src/core/mpeg/buffer.cpp \
-    src/core/native32_reader.cpp src/core/sprite_system.cpp src/core/actions.cpp \
-    src/core/header_decryptor.cpp src/core/des_constants.cpp src/core/image_decoder.cpp src/core/mp3_software.cpp \
+    "$variant/src/core/mpeg/video.cpp" "$variant/src/core/mpeg/buffer.cpp" \
+    "$variant/src/core/native32_reader.cpp" "$variant/src/core/sprite_system.cpp" "$variant/src/core/actions.cpp" \
+    "$variant/src/core/header_decryptor.cpp" "$variant/src/core/des_constants.cpp" \
+    "$variant/src/core/image_decoder.cpp" "$variant/src/core/mp3_software.cpp" \
     -lz -o "tests/out/$name"
 "tests/out/$name"
